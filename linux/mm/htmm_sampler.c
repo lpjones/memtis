@@ -6,21 +6,103 @@
 #include <linux/mempolicy.h>
 #include <linux/sched.h>
 #include <linux/perf_event.h>
+#include <linux/fs.h>
+#include <linux/fdtable.h>
 #include <linux/delay.h>
 #include <linux/sched/cputime.h>
+#include <linux/cpumask.h>
+#include <linux/numa.h>
+#include <linux/err.h>
 
 #include "../kernel/events/internal.h"
 
 #include <linux/htmm.h>
 
+static struct file *memtis_trace_file;
+static loff_t memtis_trace_pos;
+
+struct pebs_rec {
+  uint64_t cyc;
+  uint64_t va;
+  uint64_t ip;
+  uint32_t cpu;
+  uint8_t  evt;
+} __attribute__((packed));
+
 struct task_struct *access_sampling = NULL;
 struct perf_event ***mem_event;
+static struct file ***mem_event_files;
+static int htmm_target_node;
+
+static void htmm_release_mem_events(void)
+{
+	int cpu, event;
+
+	if (!mem_event)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		if (mem_event_files && mem_event_files[cpu]) {
+			for (event = 0; event < N_HTMMEVENTS; event++) {
+				if (mem_event_files[cpu][event]) {
+					fput(mem_event_files[cpu][event]);
+					mem_event_files[cpu][event] = NULL;
+				}
+			}
+			kfree(mem_event_files[cpu]);
+		}
+
+		kfree(mem_event[cpu]);
+	}
+
+	kfree(mem_event_files);
+	mem_event_files = NULL;
+	kfree(mem_event);
+	mem_event = NULL;
+}
+
+static const struct cpumask *htmm_sample_cpumask(void)
+{
+	if (htmm_target_node >= 0 && htmm_target_node < nr_node_ids &&
+	    !cpumask_empty(cpumask_of_node(htmm_target_node)))
+		return cpumask_of_node(htmm_target_node);
+
+	return cpu_online_mask;
+}
+
+static inline bool htmm_perf_rb_copy(struct perf_buffer *rb, u64 offset,
+				     void *dst, size_t size)
+{
+	unsigned long page_sz;
+	unsigned long pg_shift;
+	size_t copied = 0;
+
+	if (!rb || !dst || !size || !rb->nr_pages) {
+		printk("invalid argument(s) for htmm_perf_rb_copy\n");
+		return false;
+	}
+
+	pg_shift = PAGE_SHIFT + page_order(rb);
+	page_sz = 1UL << pg_shift;
+
+	while (copied < size) {
+		u64 cur = offset + copied;
+		unsigned long pg = (cur >> pg_shift) % rb->nr_pages;
+		unsigned long in_page = cur & (page_sz - 1);
+		size_t chunk = min_t(size_t, size - copied, page_sz - in_page);
+
+		memcpy((char *)dst + copied, rb->data_pages[pg] + in_page, chunk);
+		copied += chunk;
+	}
+
+	return true;
+}
 
 static bool valid_va(unsigned long addr)
 {
-    if (!(addr >> (PGDIR_SHIFT + 9)) && addr != 0)
+	if (!(addr >> (PGDIR_SHIFT + 9)) && addr != 0)
 	return true;
-    else
+
 	return false;
 }
 
@@ -49,11 +131,9 @@ static __u64 get_pebs_event(enum events e)
 static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
 	__u64 type, __u32 pid)
 {
-    struct perf_event_attr attr;
+    struct perf_event_attr attr = {0};
     struct file *file;
     int event_fd, __pid;
-
-    memset(&attr, 0, sizeof(struct perf_event_attr));
 
     attr.type = PERF_TYPE_RAW;
     attr.size = sizeof(struct perf_event_attr);
@@ -65,21 +145,24 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
 	attr.sample_period = get_sample_period(0);
     attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR;
     attr.disabled = 0;
+	attr.inherit = 1;
     attr.exclude_kernel = 1;
     attr.exclude_hv = 1;
     attr.exclude_callchain_kernel = 1;
     attr.exclude_callchain_user = 1;
     attr.precise_ip = 1;
-    attr.enable_on_exec = 1;
 
-    if (pid == 0)
-	__pid = -1;
-    else
-	__pid = pid;
+    // if (pid == 0)
+	// __pid = -1;
+    // else
+	// __pid = pid;
+	__pid = -1; // for system-wide sampling, set pid to -1 to capture events from all processes
+
+	printk("pid: %d, cpu: %llu, event: %llu\n", __pid, cpu, config);
 	
     event_fd = htmm__perf_event_open(&attr, __pid, cpu, -1, 0);
     //event_fd = htmm__perf_event_open(&attr, -1, cpu, -1, 0);
-    if (event_fd <= 0) {
+    if (event_fd < 0) {
 	printk("[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
 	return -1;
     }
@@ -87,23 +170,56 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
     file = fget(event_fd);
     if (!file) {
 	printk("invalid file\n");
+	close_fd(event_fd);
 	return -1;
     }
-    mem_event[cpu][type] = fget(event_fd)->private_data;
+	close_fd(event_fd);
+
+	if (!mem_event_files || !mem_event_files[cpu]) {
+	fput(file);
+	return -ENOMEM;
+	}
+
+    mem_event[cpu][type] = file->private_data;
+	mem_event_files[cpu][type] = file;
+    printk("[pebs_open] cpu=%llu, event=%llu, perf_event=%p, state=%d, period=%lld\n",
+    	   cpu, config, mem_event[cpu][type],
+    	   mem_event[cpu][type]->state,
+	   local64_read(&mem_event[cpu][type]->hw.period_left));
     return 0;
 }
 
 static int pebs_init(pid_t pid, int node)
 {
     int cpu, event;
+    const struct cpumask *sample_mask;
 
-    mem_event = kzalloc(sizeof(struct perf_event **) * CPUS_PER_SOCKET, GFP_KERNEL);
-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
-	mem_event[cpu] = kzalloc(sizeof(struct perf_event *) * N_HTMMEVENTS, GFP_KERNEL);
+    htmm_target_node = node;
+    sample_mask = htmm_sample_cpumask();
+
+    mem_event = kcalloc(nr_cpu_ids, sizeof(*mem_event), GFP_KERNEL);
+    if (!mem_event)
+	return -ENOMEM;
+
+    mem_event_files = kcalloc(nr_cpu_ids, sizeof(*mem_event_files), GFP_KERNEL);
+    if (!mem_event_files) {
+	kfree(mem_event);
+	mem_event = NULL;
+	return -ENOMEM;
+	}
+
+    for_each_possible_cpu(cpu) {
+	mem_event[cpu] = kcalloc(N_HTMMEVENTS, sizeof(*mem_event[cpu]), GFP_KERNEL);
+	mem_event_files[cpu] = kcalloc(N_HTMMEVENTS, sizeof(*mem_event_files[cpu]), GFP_KERNEL);
+	if (!mem_event[cpu] || !mem_event_files[cpu]) {
+	    htmm_release_mem_events();
+	    return -ENOMEM;
+	}
     }
-    
-    printk("pebs_init\n");   
-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
+
+    printk("pebs_init\n");
+
+    for_each_cpu(cpu, sample_mask) {
 	for (event = 0; event < N_HTMMEVENTS; event++) {
 	    if (get_pebs_event(event) == N_HTMMEVENTS) {
 		mem_event[cpu][event] = NULL;
@@ -111,46 +227,91 @@ static int pebs_init(pid_t pid, int node)
 	    }
 
 	    if (__perf_event_open(get_pebs_event(event), 0, cpu, event, pid))
-		return -1;
+		goto out_err;
 	    if (htmm__perf_event_init(mem_event[cpu][event], BUFFER_SIZE))
-		return -1;
+		goto out_err;
 	}
     }
 
     return 0;
+
+out_err:
+	htmm_release_mem_events();
+    return -1;
 }
 
 static void pebs_disable(void)
 {
     int cpu, event;
+    const struct cpumask *sample_mask = htmm_sample_cpumask();
 
     printk("pebs disable\n");
-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
-	for (event = 0; event < N_HTMMEVENTS; event++) {
-	    if (mem_event[cpu][event])
-		perf_event_disable(mem_event[cpu][event]);
-	}
+	if (!mem_event)
+		return;
+
+    for_each_cpu(cpu, sample_mask) {
+		for (event = 0; event < N_HTMMEVENTS; event++) {
+			if (mem_event[cpu] && mem_event[cpu][event])
+				perf_event_disable(mem_event[cpu][event]);
+		}
     }
+	if (memtis_trace_file) {
+		filp_close(memtis_trace_file, NULL);
+		memtis_trace_file = NULL;
+		memtis_trace_pos = 0;
+	}
+
+	htmm_release_mem_events();
 }
 
 static void pebs_enable(void)
 {
     int cpu, event;
+	const struct cpumask *sample_mask = htmm_sample_cpumask();
+	int enabled_count = 0;
 
     printk("pebs enable\n");
-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
+    if (!mem_event)
+	return;
+
+	memtis_trace_file = filp_open("/tmp/memtis_pebs_trace.bin",
+				     O_WRONLY | O_CREAT | O_TRUNC,
+				     0600);
+	if (IS_ERR(memtis_trace_file)) {
+		printk("failed to open memtis trace file: %ld\n",
+		       PTR_ERR(memtis_trace_file));
+		memtis_trace_file = NULL;
+		return;
+	}
+	memtis_trace_pos = 0;
+
+	for_each_cpu(cpu, sample_mask) {
+	if (!mem_event[cpu])
+	    continue;
 	for (event = 0; event < N_HTMMEVENTS; event++) {
-	    if (mem_event[cpu][event])
+	    if (mem_event[cpu][event]) {
+	    	struct perf_event *e = mem_event[cpu][event];
+	    	printk("[enable_evt] cpu=%d event=%d config=%llu state_before=%d\n",
+	    	       cpu, event, e->attr.config, e->state);
 		perf_event_enable(mem_event[cpu][event]);
+		enabled_count++;
+	    }
 	}
     }
+    printk("[enable_done] total_enabled=%d\n", enabled_count);
 }
 
 static void pebs_update_period(uint64_t value, uint64_t inst_value)
 {
     int cpu, event;
+    const struct cpumask *sample_mask = htmm_sample_cpumask();
 
-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
+    if (!mem_event)
+	return;
+
+    for_each_cpu(cpu, sample_mask) {
+	if (!mem_event[cpu])
+	    continue;
 	for (event = 0; event < N_HTMMEVENTS; event++) {
 	    int ret;
 	    if (!mem_event[cpu][event])
@@ -195,7 +356,8 @@ static int ksamplingd(void *data)
     unsigned long trace_cputime, trace_period = msecs_to_jiffies(1500); // 3s
     unsigned long trace_runtime;
     /* for timeout */ 
-    unsigned long sleep_timeout;
+	unsigned long sleep_timeout;
+	const struct cpumask *sample_mask;
 
     /* for analytic purpose */
     unsigned long hr_dram = 0, hr_nvm = 0;
@@ -208,9 +370,9 @@ static int ksamplingd(void *data)
 
     /* TODO implements per-CPU node ksamplingd by using pg_data_t */
     /* Currently uses a single CPU node(0) */
-    const struct cpumask *cpumask = cpumask_of_node(0);
-    if (!cpumask_empty(cpumask))
-	do_set_cpus_allowed(access_sampling, cpumask);
+	sample_mask = htmm_sample_cpumask();
+	if (!cpumask_empty(sample_mask))
+	do_set_cpus_allowed(access_sampling, sample_mask);
 
     while (!kthread_should_stop()) {
 	int cpu, event, cond = false;
@@ -220,64 +382,88 @@ static int ksamplingd(void *data)
 	    continue;
 	}
 	
-	for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
+	for_each_cpu(cpu, sample_mask) {
 	    for (event = 0; event < N_HTMMEVENTS; event++) {
 		do {
 		    struct perf_buffer *rb;
 		    struct perf_event_mmap_page *up;
-		    struct perf_event_header *ph;
-		    struct htmm_event *he;
-		    unsigned long pg_index, offset;
-		    int page_shift;
-		    __u64 head;
+		    struct perf_event_header ph;
+		    struct htmm_event he;
+		    __u64 head, tail, avail;
 
-		    if (!mem_event[cpu][event]) {
-			//continue;
-			break;
+		    if (!mem_event || !mem_event[cpu] || !mem_event[cpu][event]) {
+				break;
 		    }
 
 		    __sync_synchronize();
 
 		    rb = mem_event[cpu][event]->rb;
 		    if (!rb) {
-			printk("event->rb is NULL\n");
-			return -1;
+				pr_warn_ratelimited("htmm: event->rb is NULL for cpu=%d event=%d, event_state=%d\n", 
+							cpu, event, mem_event[cpu][event]->state);
+				break;
 		    }
 		    /* perf_buffer is ring buffer */
 		    up = READ_ONCE(rb->user_page);
 		    head = READ_ONCE(up->data_head);
-		    if (head == up->data_tail) {
-			if (cpu < 16)
-			    nr_skip++;
-			//continue;
-			break;
+		    tail = READ_ONCE(up->data_tail);
+		    if (head == tail) {
+				if (cpu < 16) {
+					nr_skip++;
+
+				}
+				break;
 		    }
 
-		    head -= up->data_tail;
-		    if (head > (BUFFER_SIZE * ksampled_max_sample_ratio / 100)) {
+		    avail = head - tail;
+		    if (avail > (BUFFER_SIZE * ksampled_max_sample_ratio / 100)) {
 			cond = true;
-		    } else if (head < (BUFFER_SIZE * ksampled_min_sample_ratio / 100)) {
+		    } else if (avail < (BUFFER_SIZE * ksampled_min_sample_ratio / 100)) {
 			cond = false;
 		    }
+
+		    if (avail < sizeof(ph))
+			break;
 
 		    /* read barrier */
 		    smp_rmb();
 
-		    page_shift = PAGE_SHIFT + page_order(rb);
-		    /* get address of a tail sample */
-		    offset = READ_ONCE(up->data_tail);
-		    pg_index = (offset >> page_shift) & (rb->nr_pages - 1);
-		    offset &= (1 << page_shift) - 1;
+		    if (!htmm_perf_rb_copy(rb, tail, &ph, sizeof(ph)))
+			break;
 
-		    ph = (void*)(rb->data_pages[pg_index] + offset);
-		    switch (ph->type) {
-			case PERF_RECORD_SAMPLE:
-			    he = (struct htmm_event *)ph;
-			    if (!valid_va(he->addr)) {
+		    if (ph.size < sizeof(ph) || ph.size > avail) {
+			WRITE_ONCE(up->data_tail, head);
+			break;
+		    }
+
+		    switch (ph.type) {
+			case PERF_RECORD_SAMPLE: {
+			    struct pebs_rec rec;
+
+			    if (ph.size < sizeof(he) ||
+				!htmm_perf_rb_copy(rb, tail, &he, sizeof(he)) ||
+				!valid_va(he.addr)) {
 				break;
 			    }
 
-			    update_pginfo(he->pid, he->addr, event);
+			    rec.cyc = rdtsc();
+			    rec.va = he.addr;
+			    rec.ip = he.ip;
+			    rec.cpu = cpu;
+			    rec.evt = event;
+				if (memtis_trace_file) {
+					ssize_t written;
+
+					written = kernel_write(memtis_trace_file,
+							       &rec,
+							       sizeof(rec),
+							       &memtis_trace_pos);
+					if (written != sizeof(rec))
+						pr_warn_ratelimited("htmm: trace write failed (%zd)\n",
+								    written);
+				}
+
+			    update_pginfo(he.pid, he.addr, event);
 			    //count_vm_event(HTMM_NR_SAMPLED);
 			    nr_sampled++;
 
@@ -292,6 +478,7 @@ static int ksamplingd(void *data)
 			    else
 				nr_write++;
 			    break;
+			}
 			case PERF_RECORD_THROTTLE:
 			case PERF_RECORD_UNTHROTTLE:
 			    nr_throttled++;
@@ -312,7 +499,7 @@ static int ksamplingd(void *data)
 		    }
 		    /* read, write barrier */
 		    smp_mb();
-		    WRITE_ONCE(up->data_tail, up->data_tail + ph->size);
+		    WRITE_ONCE(up->data_tail, tail + ph.size);
 		} while (cond);
 	    }
 	}
@@ -416,6 +603,8 @@ int ksamplingd_init(pid_t pid, int node)
 	printk("htmm__perf_event_init failure... ERROR:%d\n", ret);
 	return 0;
     }
+
+	pebs_enable();
 
     return ksamplingd_run();
 }

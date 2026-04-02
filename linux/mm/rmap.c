@@ -993,7 +993,7 @@ int cooling_page(struct page *page, struct mem_cgroup *memcg)
 	.arg = (void *)&hca,
     };
 
-    if (!memcg || !memcg->htmm_enabled)
+	if (!memcg || !memcg->htmm_enabled)
 	return false;
 
     if (!PageAnon(page) || PageKsm(page))

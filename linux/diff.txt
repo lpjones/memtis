@@ -1,0 +1,770 @@
+diff --git a/linux/include/linux/htmm.h b/linux/include/linux/htmm.h
+index e3ab4b695..efa8687ab 100644
+--- a/linux/include/linux/htmm.h
++++ b/linux/include/linux/htmm.h
+@@ -3,14 +3,16 @@
+ #define DEFERRED_SPLIT_ISOLATED 1
+ 
+ #define BUFFER_SIZE	32 /* 128: 1MB */
+-#define CPUS_PER_SOCKET 20
++#define CPUS_PER_SOCKET 16
+ #define MAX_MIGRATION_RATE_IN_MBPS  2048 /* 2048MB per sec */
+ 
+ 
+ /* pebs events */
+ #define DRAM_LLC_LOAD_MISS  0x1d3
+-#define REMOTE_DRAM_LLC_LOAD_MISS   0x2d3
+-#define NVM_LLC_LOAD_MISS   0x80d1
++#define REMOTE_DRAM_LLC_LOAD_MISS   0x4d3
++// #define REMOTE_DRAM_LLC_LOAD_MISS   0x2d3
++#define NVM_LLC_LOAD_MISS   0x4d3
++// #define NVM_LLC_LOAD_MISS   0x80d1
+ #define ALL_STORES	    0x82d0
+ #define ALL_LOADS	    0x81d0
+ #define STLB_MISS_STORES    0x12d0
+@@ -80,6 +82,8 @@ struct htmm_event {
+     __u64 addr;
+ };
+ 
++struct mem_cgroup_per_node;
++
+ enum events {
+     DRAMREAD = 0,
+     NVMREAD = 1,
+diff --git a/linux/kernel/events/core.c b/linux/kernel/events/core.c
+index 617eae0c9..dab6d31e7 100644
+--- a/linux/kernel/events/core.c
++++ b/linux/kernel/events/core.c
+@@ -12552,9 +12552,15 @@ int htmm__perf_event_init(struct perf_event *event, unsigned long nr_pages)
+ 	    event->cpu, flags);
+     if (!rb) {
+ 	ret = -ENOMEM;
++	printk("[htmm_init_fail] rb_alloc failed for cpu=%d type=%llu nr_pages=%lu\n",
++	       event->cpu, event->attr.config, nr_pages);
+ 	goto unlock;
+     }
+ 
++    // printk("[htmm_init_ok] cpu=%d type=%llu attr.type=%u config=%llu precise_ip=%d state=%d\n",
++	//    event->cpu, event->attr.config, event->attr.type, event->attr.config, 
++	//    event->attr.precise_ip, event->state);
++
+     ring_buffer_attach(event, rb);
+     perf_event_init_userpage(event);
+     perf_event_update_userpage(event);
+diff --git a/linux/mm/htmm_core.c b/linux/mm/htmm_core.c
+index c4ecbc0e8..d71654e30 100644
+--- a/linux/mm/htmm_core.c
++++ b/linux/mm/htmm_core.c
+@@ -24,7 +24,7 @@ void htmm_mm_init(struct mm_struct *mm)
+ {
+     struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
+ 
+-    if (!memcg || !memcg->htmm_enabled) {
++	if (!memcg || !memcg->htmm_enabled) {
+ 	mm->htmm_enabled = false;
+ 	return;
+     }
+@@ -477,8 +477,7 @@ unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
+     spin_lock_irqsave(&ds_queue->split_queue_lock, flags); 
+     list_splice_tail(&list, &ds_queue->split_queue);
+     spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
+-    
+-    putback_movable_pages(&failed_list); 
++
+     if (split)
+ 	pn->memcg->split_happen = true;
+     return split;
+diff --git a/linux/mm/htmm_migrater.c b/linux/mm/htmm_migrater.c
+index 5957dc787..d20f1a5cc 100644
+--- a/linux/mm/htmm_migrater.c
++++ b/linux/mm/htmm_migrater.c
+@@ -702,6 +702,9 @@ static unsigned long cooling_active_list(unsigned long nr_to_scan,
+ 		    if (deferred_split_huge_page_for_htmm(compound_head(page))) {
+ 			spin_unlock_irq(&lruvec->lru_lock);
+ 			check_transhuge_cooling((void *)memcg, page, false);
++			/* Page was isolated (lru_size decremented, isolation ref held).
++			 * putback_lru_page restores lru_size and drops the iso ref. */
++			putback_lru_page(page);
+ 			continue;
+ 		    }
+ 		    spin_unlock_irq(&lruvec->lru_lock);
+@@ -826,15 +829,22 @@ static unsigned long adjusting_lru_list(unsigned long nr_to_scan,
+ 	}
+ #ifdef DEFERRED_SPLIT_ISOLATED
+ 	if (PageCompound(page) && check_split_huge_page(memcg, get_meta_page(page), false)) {
++	    bool sent_to_split_queue;
+ 
+ 	    spin_lock_irq(&lruvec->lru_lock);
+-	    if (!deferred_split_huge_page_for_htmm(compound_head(page))) {
++	    sent_to_split_queue = deferred_split_huge_page_for_htmm(compound_head(page));
++	    if (!sent_to_split_queue) {
+ 	        if (PageActive(page))
+ 		    list_add(&page->lru, &l_active);
+ 		else
+ 		    list_add(&page->lru, &l_inactive);
+ 	    }
+ 	    spin_unlock_irq(&lruvec->lru_lock);
++	    if (sent_to_split_queue) {
++		/* Page was isolated (lru_size decremented, isolation ref held).
++		 * putback_lru_page restores lru_size and drops the iso ref. */
++		putback_lru_page(page);
++	    }
+ 	    continue;
+ 	}
+ #endif
+diff --git a/linux/mm/htmm_sampler.c b/linux/mm/htmm_sampler.c
+index 778b5a45f..48e2484d6 100644
+--- a/linux/mm/htmm_sampler.c
++++ b/linux/mm/htmm_sampler.c
+@@ -6,21 +6,103 @@
+ #include <linux/mempolicy.h>
+ #include <linux/sched.h>
+ #include <linux/perf_event.h>
++#include <linux/fs.h>
++#include <linux/fdtable.h>
+ #include <linux/delay.h>
+ #include <linux/sched/cputime.h>
++#include <linux/cpumask.h>
++#include <linux/numa.h>
++#include <linux/err.h>
+ 
+ #include "../kernel/events/internal.h"
+ 
+ #include <linux/htmm.h>
+ 
++static struct file *memtis_trace_file;
++static loff_t memtis_trace_pos;
++
++struct pebs_rec {
++  uint64_t cyc;
++  uint64_t va;
++  uint64_t ip;
++  uint32_t cpu;
++  uint8_t  evt;
++} __attribute__((packed));
++
+ struct task_struct *access_sampling = NULL;
+ struct perf_event ***mem_event;
++static struct file ***mem_event_files;
++static int htmm_target_node;
++
++static void htmm_release_mem_events(void)
++{
++	int cpu, event;
++
++	if (!mem_event)
++		return;
++
++	for_each_possible_cpu(cpu) {
++		if (mem_event_files && mem_event_files[cpu]) {
++			for (event = 0; event < N_HTMMEVENTS; event++) {
++				if (mem_event_files[cpu][event]) {
++					fput(mem_event_files[cpu][event]);
++					mem_event_files[cpu][event] = NULL;
++				}
++			}
++			kfree(mem_event_files[cpu]);
++		}
++
++		kfree(mem_event[cpu]);
++	}
++
++	kfree(mem_event_files);
++	mem_event_files = NULL;
++	kfree(mem_event);
++	mem_event = NULL;
++}
++
++static const struct cpumask *htmm_sample_cpumask(void)
++{
++	if (htmm_target_node >= 0 && htmm_target_node < nr_node_ids &&
++	    !cpumask_empty(cpumask_of_node(htmm_target_node)))
++		return cpumask_of_node(htmm_target_node);
++
++	return cpu_online_mask;
++}
++
++static inline bool htmm_perf_rb_copy(struct perf_buffer *rb, u64 offset,
++				     void *dst, size_t size)
++{
++	unsigned long page_sz;
++	unsigned long pg_shift;
++	size_t copied = 0;
++
++	if (!rb || !dst || !size || !rb->nr_pages) {
++		printk("invalid argument(s) for htmm_perf_rb_copy\n");
++		return false;
++	}
++
++	pg_shift = PAGE_SHIFT + page_order(rb);
++	page_sz = 1UL << pg_shift;
++
++	while (copied < size) {
++		u64 cur = offset + copied;
++		unsigned long pg = (cur >> pg_shift) % rb->nr_pages;
++		unsigned long in_page = cur & (page_sz - 1);
++		size_t chunk = min_t(size_t, size - copied, page_sz - in_page);
++
++		memcpy((char *)dst + copied, rb->data_pages[pg] + in_page, chunk);
++		copied += chunk;
++	}
++
++	return true;
++}
+ 
+ static bool valid_va(unsigned long addr)
+ {
+-    if (!(addr >> (PGDIR_SHIFT + 9)) && addr != 0)
++	if (!(addr >> (PGDIR_SHIFT + 9)) && addr != 0)
+ 	return true;
+-    else
++
+ 	return false;
+ }
+ 
+@@ -49,12 +131,10 @@ static __u64 get_pebs_event(enum events e)
+ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
+ 	__u64 type, __u32 pid)
+ {
+-    struct perf_event_attr attr;
++    struct perf_event_attr attr = {0};
+     struct file *file;
+     int event_fd, __pid;
+ 
+-    memset(&attr, 0, sizeof(struct perf_event_attr));
+-
+     attr.type = PERF_TYPE_RAW;
+     attr.size = sizeof(struct perf_event_attr);
+     attr.config = config;
+@@ -65,21 +145,24 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
+ 	attr.sample_period = get_sample_period(0);
+     attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR;
+     attr.disabled = 0;
++	attr.inherit = 1;
+     attr.exclude_kernel = 1;
+     attr.exclude_hv = 1;
+     attr.exclude_callchain_kernel = 1;
+     attr.exclude_callchain_user = 1;
+     attr.precise_ip = 1;
+-    attr.enable_on_exec = 1;
+ 
+-    if (pid == 0)
+-	__pid = -1;
+-    else
+-	__pid = pid;
++    // if (pid == 0)
++	// __pid = -1;
++    // else
++	// __pid = pid;
++	__pid = -1; // for system-wide sampling, set pid to -1 to capture events from all processes
++
++	printk("pid: %d, cpu: %llu, event: %llu\n", __pid, cpu, config);
+ 	
+     event_fd = htmm__perf_event_open(&attr, __pid, cpu, -1, 0);
+     //event_fd = htmm__perf_event_open(&attr, -1, cpu, -1, 0);
+-    if (event_fd <= 0) {
++    if (event_fd < 0) {
+ 	printk("[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
+ 	return -1;
+     }
+@@ -87,23 +170,56 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
+     file = fget(event_fd);
+     if (!file) {
+ 	printk("invalid file\n");
++	close_fd(event_fd);
+ 	return -1;
+     }
+-    mem_event[cpu][type] = fget(event_fd)->private_data;
++	close_fd(event_fd);
++
++	if (!mem_event_files || !mem_event_files[cpu]) {
++	fput(file);
++	return -ENOMEM;
++	}
++
++    mem_event[cpu][type] = file->private_data;
++	mem_event_files[cpu][type] = file;
++    printk("[pebs_open] cpu=%llu, event=%llu, perf_event=%p, state=%d, period=%lld\n",
++    	   cpu, config, mem_event[cpu][type],
++    	   mem_event[cpu][type]->state,
++	   local64_read(&mem_event[cpu][type]->hw.period_left));
+     return 0;
+ }
+ 
+ static int pebs_init(pid_t pid, int node)
+ {
+     int cpu, event;
++    const struct cpumask *sample_mask;
++
++    htmm_target_node = node;
++    sample_mask = htmm_sample_cpumask();
+ 
+-    mem_event = kzalloc(sizeof(struct perf_event **) * CPUS_PER_SOCKET, GFP_KERNEL);
+-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
+-	mem_event[cpu] = kzalloc(sizeof(struct perf_event *) * N_HTMMEVENTS, GFP_KERNEL);
++    mem_event = kcalloc(nr_cpu_ids, sizeof(*mem_event), GFP_KERNEL);
++    if (!mem_event)
++	return -ENOMEM;
++
++    mem_event_files = kcalloc(nr_cpu_ids, sizeof(*mem_event_files), GFP_KERNEL);
++    if (!mem_event_files) {
++	kfree(mem_event);
++	mem_event = NULL;
++	return -ENOMEM;
++	}
++
++    for_each_possible_cpu(cpu) {
++	mem_event[cpu] = kcalloc(N_HTMMEVENTS, sizeof(*mem_event[cpu]), GFP_KERNEL);
++	mem_event_files[cpu] = kcalloc(N_HTMMEVENTS, sizeof(*mem_event_files[cpu]), GFP_KERNEL);
++	if (!mem_event[cpu] || !mem_event_files[cpu]) {
++	    htmm_release_mem_events();
++	    return -ENOMEM;
++	}
+     }
+-    
+-    printk("pebs_init\n");   
+-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++
++    printk("pebs_init\n");
++
++    for_each_cpu(cpu, sample_mask) {
+ 	for (event = 0; event < N_HTMMEVENTS; event++) {
+ 	    if (get_pebs_event(event) == N_HTMMEVENTS) {
+ 		mem_event[cpu][event] = NULL;
+@@ -111,46 +227,91 @@ static int pebs_init(pid_t pid, int node)
+ 	    }
+ 
+ 	    if (__perf_event_open(get_pebs_event(event), 0, cpu, event, pid))
+-		return -1;
++		goto out_err;
+ 	    if (htmm__perf_event_init(mem_event[cpu][event], BUFFER_SIZE))
+-		return -1;
++		goto out_err;
+ 	}
+     }
+ 
+     return 0;
++
++out_err:
++	htmm_release_mem_events();
++    return -1;
+ }
+ 
+ static void pebs_disable(void)
+ {
+     int cpu, event;
++    const struct cpumask *sample_mask = htmm_sample_cpumask();
+ 
+     printk("pebs disable\n");
+-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
+-	for (event = 0; event < N_HTMMEVENTS; event++) {
+-	    if (mem_event[cpu][event])
+-		perf_event_disable(mem_event[cpu][event]);
+-	}
++	if (!mem_event)
++		return;
++
++    for_each_cpu(cpu, sample_mask) {
++		for (event = 0; event < N_HTMMEVENTS; event++) {
++			if (mem_event[cpu] && mem_event[cpu][event])
++				perf_event_disable(mem_event[cpu][event]);
++		}
+     }
++	if (memtis_trace_file) {
++		filp_close(memtis_trace_file, NULL);
++		memtis_trace_file = NULL;
++		memtis_trace_pos = 0;
++	}
++
++	htmm_release_mem_events();
+ }
+ 
+ static void pebs_enable(void)
+ {
+     int cpu, event;
++	const struct cpumask *sample_mask = htmm_sample_cpumask();
++	int enabled_count = 0;
+ 
+     printk("pebs enable\n");
+-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++    if (!mem_event)
++	return;
++
++	memtis_trace_file = filp_open("/tmp/memtis_pebs_trace.bin",
++				     O_WRONLY | O_CREAT | O_TRUNC,
++				     0600);
++	if (IS_ERR(memtis_trace_file)) {
++		printk("failed to open memtis trace file: %ld\n",
++		       PTR_ERR(memtis_trace_file));
++		memtis_trace_file = NULL;
++		return;
++	}
++	memtis_trace_pos = 0;
++
++	for_each_cpu(cpu, sample_mask) {
++	if (!mem_event[cpu])
++	    continue;
+ 	for (event = 0; event < N_HTMMEVENTS; event++) {
+-	    if (mem_event[cpu][event])
++	    if (mem_event[cpu][event]) {
++	    	struct perf_event *e = mem_event[cpu][event];
++	    	printk("[enable_evt] cpu=%d event=%d config=%llu state_before=%d\n",
++	    	       cpu, event, e->attr.config, e->state);
+ 		perf_event_enable(mem_event[cpu][event]);
++		enabled_count++;
++	    }
+ 	}
+     }
++    printk("[enable_done] total_enabled=%d\n", enabled_count);
+ }
+ 
+ static void pebs_update_period(uint64_t value, uint64_t inst_value)
+ {
+     int cpu, event;
++    const struct cpumask *sample_mask = htmm_sample_cpumask();
+ 
+-    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++    if (!mem_event)
++	return;
++
++    for_each_cpu(cpu, sample_mask) {
++	if (!mem_event[cpu])
++	    continue;
+ 	for (event = 0; event < N_HTMMEVENTS; event++) {
+ 	    int ret;
+ 	    if (!mem_event[cpu][event])
+@@ -195,7 +356,8 @@ static int ksamplingd(void *data)
+     unsigned long trace_cputime, trace_period = msecs_to_jiffies(1500); // 3s
+     unsigned long trace_runtime;
+     /* for timeout */ 
+-    unsigned long sleep_timeout;
++	unsigned long sleep_timeout;
++	const struct cpumask *sample_mask;
+ 
+     /* for analytic purpose */
+     unsigned long hr_dram = 0, hr_nvm = 0;
+@@ -208,9 +370,9 @@ static int ksamplingd(void *data)
+ 
+     /* TODO implements per-CPU node ksamplingd by using pg_data_t */
+     /* Currently uses a single CPU node(0) */
+-    const struct cpumask *cpumask = cpumask_of_node(0);
+-    if (!cpumask_empty(cpumask))
+-	do_set_cpus_allowed(access_sampling, cpumask);
++	sample_mask = htmm_sample_cpumask();
++	if (!cpumask_empty(sample_mask))
++	do_set_cpus_allowed(access_sampling, sample_mask);
+ 
+     while (!kthread_should_stop()) {
+ 	int cpu, event, cond = false;
+@@ -220,64 +382,88 @@ static int ksamplingd(void *data)
+ 	    continue;
+ 	}
+ 	
+-	for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++	for_each_cpu(cpu, sample_mask) {
+ 	    for (event = 0; event < N_HTMMEVENTS; event++) {
+ 		do {
+ 		    struct perf_buffer *rb;
+ 		    struct perf_event_mmap_page *up;
+-		    struct perf_event_header *ph;
+-		    struct htmm_event *he;
+-		    unsigned long pg_index, offset;
+-		    int page_shift;
+-		    __u64 head;
+-
+-		    if (!mem_event[cpu][event]) {
+-			//continue;
+-			break;
++		    struct perf_event_header ph;
++		    struct htmm_event he;
++		    __u64 head, tail, avail;
++
++		    if (!mem_event || !mem_event[cpu] || !mem_event[cpu][event]) {
++				break;
+ 		    }
+ 
+ 		    __sync_synchronize();
+ 
+ 		    rb = mem_event[cpu][event]->rb;
+ 		    if (!rb) {
+-			printk("event->rb is NULL\n");
+-			return -1;
++				pr_warn_ratelimited("htmm: event->rb is NULL for cpu=%d event=%d, event_state=%d\n", 
++							cpu, event, mem_event[cpu][event]->state);
++				break;
+ 		    }
+ 		    /* perf_buffer is ring buffer */
+ 		    up = READ_ONCE(rb->user_page);
+ 		    head = READ_ONCE(up->data_head);
+-		    if (head == up->data_tail) {
+-			if (cpu < 16)
+-			    nr_skip++;
+-			//continue;
+-			break;
++		    tail = READ_ONCE(up->data_tail);
++		    if (head == tail) {
++				if (cpu < 16) {
++					nr_skip++;
++
++				}
++				break;
+ 		    }
+ 
+-		    head -= up->data_tail;
+-		    if (head > (BUFFER_SIZE * ksampled_max_sample_ratio / 100)) {
++		    avail = head - tail;
++		    if (avail > (BUFFER_SIZE * ksampled_max_sample_ratio / 100)) {
+ 			cond = true;
+-		    } else if (head < (BUFFER_SIZE * ksampled_min_sample_ratio / 100)) {
++		    } else if (avail < (BUFFER_SIZE * ksampled_min_sample_ratio / 100)) {
+ 			cond = false;
+ 		    }
+ 
++		    if (avail < sizeof(ph))
++			break;
++
+ 		    /* read barrier */
+ 		    smp_rmb();
+ 
+-		    page_shift = PAGE_SHIFT + page_order(rb);
+-		    /* get address of a tail sample */
+-		    offset = READ_ONCE(up->data_tail);
+-		    pg_index = (offset >> page_shift) & (rb->nr_pages - 1);
+-		    offset &= (1 << page_shift) - 1;
+-
+-		    ph = (void*)(rb->data_pages[pg_index] + offset);
+-		    switch (ph->type) {
+-			case PERF_RECORD_SAMPLE:
+-			    he = (struct htmm_event *)ph;
+-			    if (!valid_va(he->addr)) {
++		    if (!htmm_perf_rb_copy(rb, tail, &ph, sizeof(ph)))
++			break;
++
++		    if (ph.size < sizeof(ph) || ph.size > avail) {
++			WRITE_ONCE(up->data_tail, head);
++			break;
++		    }
++
++		    switch (ph.type) {
++			case PERF_RECORD_SAMPLE: {
++			    struct pebs_rec rec;
++
++			    if (ph.size < sizeof(he) ||
++				!htmm_perf_rb_copy(rb, tail, &he, sizeof(he)) ||
++				!valid_va(he.addr)) {
+ 				break;
+ 			    }
+ 
+-			    update_pginfo(he->pid, he->addr, event);
++			    rec.cyc = rdtsc();
++			    rec.va = he.addr;
++			    rec.ip = he.ip;
++			    rec.cpu = cpu;
++			    rec.evt = event;
++				if (memtis_trace_file) {
++					ssize_t written;
++
++					written = kernel_write(memtis_trace_file,
++							       &rec,
++							       sizeof(rec),
++							       &memtis_trace_pos);
++					if (written != sizeof(rec))
++						pr_warn_ratelimited("htmm: trace write failed (%zd)\n",
++								    written);
++				}
++
++			    update_pginfo(he.pid, he.addr, event);
+ 			    //count_vm_event(HTMM_NR_SAMPLED);
+ 			    nr_sampled++;
+ 
+@@ -292,6 +478,7 @@ static int ksamplingd(void *data)
+ 			    else
+ 				nr_write++;
+ 			    break;
++			}
+ 			case PERF_RECORD_THROTTLE:
+ 			case PERF_RECORD_UNTHROTTLE:
+ 			    nr_throttled++;
+@@ -312,7 +499,7 @@ static int ksamplingd(void *data)
+ 		    }
+ 		    /* read, write barrier */
+ 		    smp_mb();
+-		    WRITE_ONCE(up->data_tail, up->data_tail + ph->size);
++		    WRITE_ONCE(up->data_tail, tail + ph.size);
+ 		} while (cond);
+ 	    }
+ 	}
+@@ -417,6 +604,8 @@ int ksamplingd_init(pid_t pid, int node)
+ 	return 0;
+     }
+ 
++	pebs_enable();
++
+     return ksamplingd_run();
+ }
+ 
+diff --git a/linux/mm/memcontrol.c b/linux/mm/memcontrol.c
+index 9ecdf68f6..dbf37eec0 100644
+--- a/linux/mm/memcontrol.c
++++ b/linux/mm/memcontrol.c
+@@ -7803,4 +7803,4 @@ int mem_cgroup_per_node_htmm_init(void)
+     return 0;
+ }
+ subsys_initcall(mem_cgroup_per_node_htmm_init);
+-#endif /* CONFIG_HTMM */
++#endif /* CONFIG_HTMM */
+\ No newline at end of file
+diff --git a/linux/mm/mempolicy.c b/linux/mm/mempolicy.c
+index 3630fe9b4..d4409195e 100644
+--- a/linux/mm/mempolicy.c
++++ b/linux/mm/mempolicy.c
+@@ -2105,7 +2105,7 @@ struct page *alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
+ 	}
+ 
+ #ifdef CONFIG_HTMM /* alloc_pages_vma() */
+-	if (vma->vm_mm && vma->vm_mm->htmm_enabled) {
++    if (vma->vm_mm && vma->vm_mm->htmm_enabled) {
+ 	    struct task_struct *p = current;
+ 	    struct mem_cgroup *memcg = mem_cgroup_from_task(p);
+ 	    unsigned long max_nr_pages;
+diff --git a/linux/mm/rmap.c b/linux/mm/rmap.c
+index 88685fe28..c91a8fa9d 100644
+--- a/linux/mm/rmap.c
++++ b/linux/mm/rmap.c
+@@ -993,7 +993,7 @@ int cooling_page(struct page *page, struct mem_cgroup *memcg)
+ 	.arg = (void *)&hca,
+     };
+ 
+-    if (!memcg || !memcg->htmm_enabled)
++	if (!memcg || !memcg->htmm_enabled)
+ 	return false;
+ 
+     if (!PageAnon(page) || PageKsm(page))
+diff --git a/memtis-userspace/scripts/run_bench.sh b/memtis-userspace/scripts/run_bench.sh
+index 16b240393..b6dc44b38 100755
+--- a/memtis-userspace/scripts/run_bench.sh
++++ b/memtis-userspace/scripts/run_bench.sh
+@@ -10,7 +10,9 @@ MEM_NODES=($(ls /sys/devices/system/node | grep node | awk -F 'node' '{print $NF
+ 
+ CGROUP_NAME="htmm"
+ ###### update DIR!
+-DIR=/home/taehyung/workspace/memtis/memtis-userspace
++DIR=/proj/TppPlus/tpp/memtis/memtis-userspace
++plot_dir=/proj/TppPlus/tpp/scripts/plot_scripts
++py_bin=/proj/TppPlus/tpp/scripts/venv/bin/python
+ 
+ CONFIG_PERF=off
+ CONFIG_NS=off
+@@ -22,6 +24,7 @@ VER=""
+ 
+ function func_cache_flush() {
+     echo 3 > /proc/sys/vm/drop_caches
++	sync
+     free
+     return
+ }
+@@ -84,7 +87,7 @@ function func_prepare() {
+ 		export STATIC_DRAM
+ 	    fi
+ 	fi
+-
++	echo "${DIR}/bench_cmds/${BENCH_NAME}.sh"
+ 	if [[ -e ${DIR}/bench_cmds/${BENCH_NAME}.sh ]]; then
+ 	    source ${DIR}/bench_cmds/${BENCH_NAME}.sh
+ 	else
+@@ -104,7 +107,7 @@ function func_main() {
+     fi
+     
+     # use 20 threads 
+-    PINNING="taskset -c 0-19"
++    PINNING="taskset -c 0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30"
+ 
+     echo "-----------------------"
+     echo "NVM RATIO: ${NVM_RATIO}"
+@@ -112,23 +115,54 @@ function func_main() {
+     echo "-----------------------"
+ 
+     # make directory for results
++	rm -rf ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}
+     mkdir -p ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}
+     LOG_DIR=${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}
+ 
++	func_cache_flush
++
++    # resolve requested DRAM budget for fast node (node0)
++    MAX_DRAM_SIZE=$(numastat -m | awk '$1 == "MemFree" { print int($2) }')
++    BENCH_DRAM_UPPER=${BENCH_DRAM^^}
++    REQ_DRAM_MB=""
++    DRAM_LIMIT_TO_SET=""
++
++    if [[ "${BENCH_DRAM,,}" == "max" ]]; then
++	# Keep some free room on node0 so allocations can spill to slower tiers.
++	BENCH_DRAM_BUFFER_MB=${BENCH_DRAM_BUFFER_MB:-1024}
++	REQ_DRAM_MB=$((MAX_DRAM_SIZE - BENCH_DRAM_BUFFER_MB))
++	if [[ ${REQ_DRAM_MB} -lt 1024 ]]; then
++	    echo "Available DRAM on node0 (${MAX_DRAM_SIZE}MB) is too small after buffer (${BENCH_DRAM_BUFFER_MB}MB)"
++	    echo "ERROR: reduce BENCH_DRAM_BUFFER_MB or free more DRAM"
++	    exit -1
++	fi
++	DRAM_LIMIT_TO_SET="${REQ_DRAM_MB}MB"
++	echo "Using auto DRAM budget on node0: ${DRAM_LIMIT_TO_SET} (MemFree=${MAX_DRAM_SIZE}MB, buffer=${BENCH_DRAM_BUFFER_MB}MB)"
++    else
++	if [[ ${BENCH_DRAM_UPPER} =~ ^([0-9]+)MB$ ]]; then
++	    REQ_DRAM_MB=${BASH_REMATCH[1]}
++	elif [[ ${BENCH_DRAM_UPPER} =~ ^([0-9]+)GB$ ]]; then
++	    REQ_DRAM_MB=$((BASH_REMATCH[1] * 1024))
++	else
++	    echo "ERROR: BENCH_DRAM must be [NMB], [NGB], or max"
++	    exit -1
++	fi
++
++	if [[ ${REQ_DRAM_MB} -gt ${MAX_DRAM_SIZE} ]]; then
++	    echo "Available DRAM size for ${BENCH_NAME} is only ${MAX_DRAM_SIZE}MB"
++	    echo "ERROR: abort -- change the ratio"
++	    exit -1
++	fi
++
++	DRAM_LIMIT_TO_SET="${BENCH_DRAM_UPPER}"
++    fi
++
+     # set memcg for htmm
+     sudo ${DIR}/scripts/set_htmm_memcg.sh htmm remove
+     sudo ${DIR}/scripts/set_htmm_memcg.sh htmm $$ enable
+-    sudo ${DIR}/scripts/set_mem_size.sh htmm 0 ${BENCH_DRAM}
++    sudo ${DIR}/scripts/set_mem_size.sh htmm 0 ${DRAM_LIMIT_TO_SET}
+     sleep 2
+ 
+-    # check dram size
+-    MAX_DRAM_SIZE=$(numastat -m | awk '$1 == "MemFree" { print int($2) }')
+-    if [[ ${BENCH_DRAM::-2} -gt ${MAX_DRAM_SIZE} ]]; then
+-	echo "Available DRAM size for ${BENCH_NAME} is only ${MAX_DRAM_SIZE}MB"
+-	echo "ERROR: abort -- change the ratio"
+-	exit -1
+-    fi
+-
+     cat /proc/vmstat | grep -e thp -e htmm -e pgmig > ${LOG_DIR}/before_vmstat.log 
+     # flush cache
+     func_cache_flush
+@@ -266,5 +300,21 @@ if [ -z "${BENCH_NAME}" ]; then
+     exit -1
+ fi
+ 
++function func_plot() {
++	mv /tmp/memtis_pebs_trace.bin ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/
++
++	$py_bin $plot_dir/plot_cluster_no_app.py \
++		${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/memtis_pebs_trace.bin \
++		--output ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/plot.png \
++		-fast
++
++	if [[ $BENCH_NAME == "cgups" ]]; then
++		$py_bin $plot_dir/plot_cgups_mul.py \
++			${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/output.log \
++			${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/cgups_plot.png
++	fi
++}
++
+ func_prepare
+ func_main
++func_plot
+\ No newline at end of file

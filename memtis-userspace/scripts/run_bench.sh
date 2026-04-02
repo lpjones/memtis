@@ -10,7 +10,9 @@ MEM_NODES=($(ls /sys/devices/system/node | grep node | awk -F 'node' '{print $NF
 
 CGROUP_NAME="htmm"
 ###### update DIR!
-DIR=/home/taehyung/workspace/memtis/memtis-userspace
+DIR=/proj/TppPlus/tpp/memtis/memtis-userspace
+plot_dir=/proj/TppPlus/tpp/scripts/plot_scripts
+py_bin=/proj/TppPlus/tpp/scripts/venv/bin/python
 
 CONFIG_PERF=off
 CONFIG_NS=off
@@ -22,6 +24,7 @@ VER=""
 
 function func_cache_flush() {
     echo 3 > /proc/sys/vm/drop_caches
+	sync
     free
     return
 }
@@ -84,7 +87,7 @@ function func_prepare() {
 		export STATIC_DRAM
 	    fi
 	fi
-
+	echo "${DIR}/bench_cmds/${BENCH_NAME}.sh"
 	if [[ -e ${DIR}/bench_cmds/${BENCH_NAME}.sh ]]; then
 	    source ${DIR}/bench_cmds/${BENCH_NAME}.sh
 	else
@@ -104,7 +107,7 @@ function func_main() {
     fi
     
     # use 20 threads 
-    PINNING="taskset -c 0-19"
+    PINNING="taskset -c 0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30"
 
     echo "-----------------------"
     echo "NVM RATIO: ${NVM_RATIO}"
@@ -112,22 +115,53 @@ function func_main() {
     echo "-----------------------"
 
     # make directory for results
+	rm -rf ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}
     mkdir -p ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}
     LOG_DIR=${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}
+
+	func_cache_flush
+
+    # resolve requested DRAM budget for fast node (node0)
+    MAX_DRAM_SIZE=$(numastat -m | awk '$1 == "MemFree" { print int($2) }')
+    BENCH_DRAM_UPPER=${BENCH_DRAM^^}
+    REQ_DRAM_MB=""
+    DRAM_LIMIT_TO_SET=""
+
+    if [[ "${BENCH_DRAM,,}" == "max" ]]; then
+	# Keep some free room on node0 so allocations can spill to slower tiers.
+	BENCH_DRAM_BUFFER_MB=${BENCH_DRAM_BUFFER_MB:-1024}
+	REQ_DRAM_MB=$((MAX_DRAM_SIZE - BENCH_DRAM_BUFFER_MB))
+	if [[ ${REQ_DRAM_MB} -lt 1024 ]]; then
+	    echo "Available DRAM on node0 (${MAX_DRAM_SIZE}MB) is too small after buffer (${BENCH_DRAM_BUFFER_MB}MB)"
+	    echo "ERROR: reduce BENCH_DRAM_BUFFER_MB or free more DRAM"
+	    exit -1
+	fi
+	DRAM_LIMIT_TO_SET="${REQ_DRAM_MB}MB"
+	echo "Using auto DRAM budget on node0: ${DRAM_LIMIT_TO_SET} (MemFree=${MAX_DRAM_SIZE}MB, buffer=${BENCH_DRAM_BUFFER_MB}MB)"
+    else
+	if [[ ${BENCH_DRAM_UPPER} =~ ^([0-9]+)MB$ ]]; then
+	    REQ_DRAM_MB=${BASH_REMATCH[1]}
+	elif [[ ${BENCH_DRAM_UPPER} =~ ^([0-9]+)GB$ ]]; then
+	    REQ_DRAM_MB=$((BASH_REMATCH[1] * 1024))
+	else
+	    echo "ERROR: BENCH_DRAM must be [NMB], [NGB], or max"
+	    exit -1
+	fi
+
+	if [[ ${REQ_DRAM_MB} -gt ${MAX_DRAM_SIZE} ]]; then
+	    echo "Available DRAM size for ${BENCH_NAME} is only ${MAX_DRAM_SIZE}MB"
+	    echo "ERROR: abort -- change the ratio"
+	    exit -1
+	fi
+
+	DRAM_LIMIT_TO_SET="${BENCH_DRAM_UPPER}"
+    fi
 
     # set memcg for htmm
     sudo ${DIR}/scripts/set_htmm_memcg.sh htmm remove
     sudo ${DIR}/scripts/set_htmm_memcg.sh htmm $$ enable
-    sudo ${DIR}/scripts/set_mem_size.sh htmm 0 ${BENCH_DRAM}
+    sudo ${DIR}/scripts/set_mem_size.sh htmm 0 ${DRAM_LIMIT_TO_SET}
     sleep 2
-
-    # check dram size
-    MAX_DRAM_SIZE=$(numastat -m | awk '$1 == "MemFree" { print int($2) }')
-    if [[ ${BENCH_DRAM::-2} -gt ${MAX_DRAM_SIZE} ]]; then
-	echo "Available DRAM size for ${BENCH_NAME} is only ${MAX_DRAM_SIZE}MB"
-	echo "ERROR: abort -- change the ratio"
-	exit -1
-    fi
 
     cat /proc/vmstat | grep -e thp -e htmm -e pgmig > ${LOG_DIR}/before_vmstat.log 
     # flush cache
@@ -266,5 +300,21 @@ if [ -z "${BENCH_NAME}" ]; then
     exit -1
 fi
 
+function func_plot() {
+	mv /tmp/memtis_pebs_trace.bin ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/
+
+	$py_bin $plot_dir/plot_cluster_no_app.py \
+		${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/memtis_pebs_trace.bin \
+		--output ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/plot.png \
+		-fast
+
+	if [[ $BENCH_NAME == "cgups" ]]; then
+		$py_bin $plot_dir/plot_cgups_mul.py \
+			${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/output.log \
+			${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/cgups_plot.png
+	fi
+}
+
 func_prepare
 func_main
+func_plot

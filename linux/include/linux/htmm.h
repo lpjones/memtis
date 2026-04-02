@@ -3,14 +3,16 @@
 #define DEFERRED_SPLIT_ISOLATED 1
 
 #define BUFFER_SIZE	32 /* 128: 1MB */
-#define CPUS_PER_SOCKET 20
+#define CPUS_PER_SOCKET 16
 #define MAX_MIGRATION_RATE_IN_MBPS  2048 /* 2048MB per sec */
 
 
 /* pebs events */
 #define DRAM_LLC_LOAD_MISS  0x1d3
-#define REMOTE_DRAM_LLC_LOAD_MISS   0x2d3
-#define NVM_LLC_LOAD_MISS   0x80d1
+#define REMOTE_DRAM_LLC_LOAD_MISS   0x4d3
+// #define REMOTE_DRAM_LLC_LOAD_MISS   0x2d3
+#define NVM_LLC_LOAD_MISS   0x4d3
+// #define NVM_LLC_LOAD_MISS   0x80d1
 #define ALL_STORES	    0x82d0
 #define ALL_LOADS	    0x81d0
 #define STLB_MISS_STORES    0x12d0
@@ -79,6 +81,8 @@ struct htmm_event {
     __u32 pid, tid;
     __u64 addr;
 };
+
+struct mem_cgroup_per_node;
 
 enum events {
     DRAMREAD = 0,

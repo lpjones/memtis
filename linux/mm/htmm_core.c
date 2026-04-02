@@ -24,7 +24,7 @@ void htmm_mm_init(struct mm_struct *mm)
 {
     struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
 
-    if (!memcg || !memcg->htmm_enabled) {
+	if (!memcg || !memcg->htmm_enabled) {
 	mm->htmm_enabled = false;
 	return;
     }
@@ -477,8 +477,7 @@ skip_isolation:
     spin_lock_irqsave(&ds_queue->split_queue_lock, flags); 
     list_splice_tail(&list, &ds_queue->split_queue);
     spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
-    
-    putback_movable_pages(&failed_list); 
+
     if (split)
 	pn->memcg->split_happen = true;
     return split;

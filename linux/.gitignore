@@ -47,6 +47,9 @@
 *.tar
 *.xz
 *.zst
+*.deb
+*.buildinfo
+*.changes
 Module.symvers
 modules.order
 

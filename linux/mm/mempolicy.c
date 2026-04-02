@@ -2105,7 +2105,7 @@ struct page *alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
 	}
 
 #ifdef CONFIG_HTMM /* alloc_pages_vma() */
-	if (vma->vm_mm && vma->vm_mm->htmm_enabled) {
+    if (vma->vm_mm && vma->vm_mm->htmm_enabled) {
 	    struct task_struct *p = current;
 	    struct mem_cgroup *memcg = mem_cgroup_from_task(p);
 	    unsigned long max_nr_pages;

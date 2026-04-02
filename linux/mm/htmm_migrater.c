@@ -702,6 +702,9 @@ static unsigned long cooling_active_list(unsigned long nr_to_scan,
 		    if (deferred_split_huge_page_for_htmm(compound_head(page))) {
 			spin_unlock_irq(&lruvec->lru_lock);
 			check_transhuge_cooling((void *)memcg, page, false);
+			/* Page was isolated (lru_size decremented, isolation ref held).
+			 * putback_lru_page restores lru_size and drops the iso ref. */
+			putback_lru_page(page);
 			continue;
 		    }
 		    spin_unlock_irq(&lruvec->lru_lock);
@@ -826,15 +829,22 @@ static unsigned long adjusting_lru_list(unsigned long nr_to_scan,
 	}
 #ifdef DEFERRED_SPLIT_ISOLATED
 	if (PageCompound(page) && check_split_huge_page(memcg, get_meta_page(page), false)) {
+	    bool sent_to_split_queue;
 
 	    spin_lock_irq(&lruvec->lru_lock);
-	    if (!deferred_split_huge_page_for_htmm(compound_head(page))) {
+	    sent_to_split_queue = deferred_split_huge_page_for_htmm(compound_head(page));
+	    if (!sent_to_split_queue) {
 	        if (PageActive(page))
 		    list_add(&page->lru, &l_active);
 		else
 		    list_add(&page->lru, &l_inactive);
 	    }
 	    spin_unlock_irq(&lruvec->lru_lock);
+	    if (sent_to_split_queue) {
+		/* Page was isolated (lru_size decremented, isolation ref held).
+		 * putback_lru_page restores lru_size and drops the iso ref. */
+		putback_lru_page(page);
+	    }
 	    continue;
 	}
 #endif

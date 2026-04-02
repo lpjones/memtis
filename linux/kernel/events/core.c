@@ -12552,8 +12552,14 @@ int htmm__perf_event_init(struct perf_event *event, unsigned long nr_pages)
 	    event->cpu, flags);
     if (!rb) {
 	ret = -ENOMEM;
+	printk("[htmm_init_fail] rb_alloc failed for cpu=%d type=%llu nr_pages=%lu\n",
+	       event->cpu, event->attr.config, nr_pages);
 	goto unlock;
     }
+
+    // printk("[htmm_init_ok] cpu=%d type=%llu attr.type=%u config=%llu precise_ip=%d state=%d\n",
+	//    event->cpu, event->attr.config, event->attr.type, event->attr.config, 
+	//    event->attr.precise_ip, event->state);
 
     ring_buffer_attach(event, rb);
     perf_event_init_userpage(event);
