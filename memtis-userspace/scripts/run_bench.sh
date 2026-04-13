@@ -303,16 +303,20 @@ fi
 function func_plot() {
 	mv /tmp/memtis_pebs_trace.bin ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/
 
-	$py_bin $plot_dir/plot_cluster_no_app.py \
-		${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/memtis_pebs_trace.bin \
-		--output ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/plot.png \
-		-fast
+	
 
 	if [[ $BENCH_NAME == "cgups" ]]; then
 		$py_bin $plot_dir/plot_cgups_mul.py \
 			${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/output.log \
 			${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/cgups_plot.png
 	fi
+
+	
+
+	$py_bin $plot_dir/plot_cluster_no_app.py \
+		${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/memtis_pebs_trace.bin \
+		--output ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/plot.png \
+		-fast
 }
 
 func_prepare
