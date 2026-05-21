@@ -1,7 +1,7 @@
 #!/bin/bash
 
-BIN=/proj/TppPlus/tpp/workloads/cgups
-BENCH_RUN="${BIN}/gups64-rw 8 move 60 kill 120"
+BIN=/proj/TppPlus/tpp/workloads/nas/NPB3.4-OMP/bin
+BENCH_RUN="${BIN}/dc.B.x"
 BENCH_DRAM="max"
 BENCH_DRAM_BUFFER_MB="1024"
 

@@ -301,22 +301,68 @@ if [ -z "${BENCH_NAME}" ]; then
 fi
 
 function func_plot() {
-	mv /tmp/memtis_pebs_trace.bin ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/
+	local app_dir=${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/
 
+	mv /tmp/memtis_pebs_trace.bin ${app_dir}
+	mv /tmp/memtis_pred.bin ${app_dir}
+	mv /tmp/memtis_promote.bin ${app_dir}
+	mv /tmp/memtis_demote.bin ${app_dir}
 	
 
 	if [[ $BENCH_NAME == "cgups" ]]; then
 		$py_bin $plot_dir/plot_cgups_mul.py \
-			${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/output.log \
-			${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/cgups_plot.png
+			${app_dir}output.log \
+			${app_dir}cgups_plot.png
 	fi
 
-	
+	rm -rf ${app_dir}pred_acc.txt
 
 	$py_bin $plot_dir/plot_cluster_no_app.py \
-		${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/memtis_pebs_trace.bin \
-		--output ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/plot.png \
+		${app_dir}memtis_pebs_trace.bin \
+		--output ${app_dir}plot.png \
 		-fast
+
+	$py_bin $plot_dir/plot_cluster_no_app.py \
+		${app_dir}memtis_pred.bin \
+		--output ${app_dir}pred_plot.png \
+		-fast
+
+	$py_bin $plot_dir/plot_cluster_no_app.py \
+		${app_dir}memtis_promote.bin \
+		--output ${app_dir}promote_plot.png \
+		-fast
+
+	$py_bin $plot_dir/plot_cluster_no_app.py \
+		${app_dir}memtis_demote.bin \
+		--output ${app_dir}demote_plot.png \
+		-fast
+
+	$py_bin "${plot_dir}/pred_acc.py" \
+        "${app_dir}/memtis_pebs_trace.bin" \
+        "${app_dir}/memtis_promote.bin" \
+        "${app_dir}/memtis_demote.bin" \
+        >> "${app_dir}/pred_acc.txt"
+
+
+    $py_bin "${plot_dir}/plot_timeliness.py" \
+        "${app_dir}/memtis_pebs_trace.bin" \
+        "${app_dir}/memtis_promote.bin" \
+        "${app_dir}/memtis_demote.bin" \
+        --output "${app_dir}/timeliness.png" \
+        >> "${app_dir}/pred_acc.txt"
+
+    $py_bin "${plot_dir}/cost_benefit.py" \
+        "${app_dir}/memtis_pebs_trace.bin" \
+        "${app_dir}/memtis_promote.bin" \
+        "${app_dir}/memtis_demote.bin" \
+        --output "${app_dir}/cost_benefit.png" \
+        >> "${app_dir}/pred_acc.txt"
+
+	# $py_bin "${plot_dir}/plot_pred_acc.py" \
+    #     ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/memtis_pebs_trace.bin \
+    #     ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/memtis_pred.bin \
+    #     --output ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/pred.png \
+    #     --tw 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1
 }
 
 func_prepare

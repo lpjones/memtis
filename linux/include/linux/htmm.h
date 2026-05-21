@@ -112,6 +112,8 @@ extern int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *
 extern void set_lru_adjusting(struct mem_cgroup *memcg, bool inc_thres);
 
 extern void update_pginfo(pid_t pid, unsigned long address, enum events e);
+extern int htmm_pred_log_start(void);
+extern void htmm_pred_log_stop(void);
 
 extern bool deferred_split_huge_page_for_htmm(struct page *page);
 extern unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,

@@ -17,8 +17,129 @@
 #include <linux/random.h>
 #include <trace/events/htmm.h>
 
+static struct file *memtis_pred_file;
+static loff_t memtis_pred_pos;
+static struct file *memtis_promote_file;
+static loff_t memtis_promote_pos;
+static struct file *memtis_demote_file;
+static loff_t memtis_demote_pos;
+
+struct pebs_rec {
+  uint64_t cyc;
+  uint64_t va;
+  uint64_t ip;
+  uint32_t cpu;
+  uint8_t  evt;
+} __attribute__((packed));
+
 #include "internal.h"
 #include <asm/pgtable.h>
+
+int htmm_pred_log_start(void)
+{
+	if (memtis_pred_file)
+		return 0;
+
+	memtis_pred_file = filp_open("/tmp/memtis_pred.bin",
+				     O_WRONLY | O_CREAT | O_TRUNC,
+				     0600);
+	if (IS_ERR(memtis_pred_file)) {
+		int err = PTR_ERR(memtis_pred_file);
+
+		printk("failed to open memtis pred file: %d\n", err);
+		memtis_pred_file = NULL;
+		return err;
+	}
+
+	memtis_promote_file = filp_open("/tmp/memtis_promote.bin",
+				     O_WRONLY | O_CREAT | O_TRUNC,
+				     0600);
+	if (IS_ERR(memtis_promote_file)) {
+		pr_warn("htmm: failed to open memtis promote file\n");
+		memtis_promote_file = NULL;
+	}
+
+	memtis_demote_file = filp_open("/tmp/memtis_demote.bin",
+				    O_WRONLY | O_CREAT | O_TRUNC,
+				    0600);
+	if (IS_ERR(memtis_demote_file)) {
+		pr_warn("htmm: failed to open memtis demote file\n");
+		memtis_demote_file = NULL;
+	}
+
+	memtis_pred_pos = 0;
+	memtis_promote_pos = 0;
+	memtis_demote_pos = 0;
+	return 0;
+}
+
+void htmm_pred_log_stop(void)
+{
+	if (memtis_pred_file) {
+		filp_close(memtis_pred_file, NULL);
+		memtis_pred_file = NULL;
+		memtis_pred_pos = 0;
+	}
+	if (memtis_promote_file) {
+		filp_close(memtis_promote_file, NULL);
+		memtis_promote_file = NULL;
+		memtis_promote_pos = 0;
+	}
+	if (memtis_demote_file) {
+		filp_close(memtis_demote_file, NULL);
+		memtis_demote_file = NULL;
+		memtis_demote_pos = 0;
+	}
+}
+
+void htmm_log_page_migration(struct page *page,
+			    enum migrate_reason reason,
+			    unsigned long target_nid,
+			    unsigned long va)
+{
+	struct pebs_rec rec;
+	int src_nid;
+	int promotion_target;
+	int demotion_target;
+	ssize_t written;
+
+	if (reason != MR_NUMA_MISPLACED)
+		return;
+
+	if (!memtis_promote_file && !memtis_demote_file)
+		return;
+
+	src_nid = page_to_nid(page);
+	promotion_target = next_promotion_node(src_nid);
+	demotion_target = next_demotion_node(src_nid);
+
+	rec.cyc = rdtsc();
+	rec.va = va;
+	rec.ip = 0;
+	rec.cpu = smp_processor_id();
+	rec.evt = 0;
+
+	if (target_nid == promotion_target && memtis_promote_file) {
+		written = kernel_write(memtis_promote_file,
+				   &rec,
+				   sizeof(rec),
+				   &memtis_promote_pos);
+		if (written != sizeof(rec))
+			pr_warn_ratelimited("htmm: promote trace write failed (%zd)\n",
+					written);
+		return;
+	}
+
+	if (target_nid == demotion_target && memtis_demote_file) {
+		written = kernel_write(memtis_demote_file,
+				   &rec,
+				   sizeof(rec),
+				   &memtis_demote_pos);
+		if (written != sizeof(rec))
+			pr_warn_ratelimited("htmm: demote trace write failed (%zd)\n",
+					written);
+	}
+}
 
 void htmm_mm_init(struct mm_struct *mm)
 {
@@ -850,7 +971,7 @@ lru_unlock:
 }
 
 static void update_base_page(struct vm_area_struct *vma,
-	struct page *page, pginfo_t *pginfo)
+	struct page *page, pginfo_t *pginfo, unsigned long address)
 {
     struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
     unsigned long prev_accessed, prev_idx, cur_idx;
@@ -888,6 +1009,27 @@ static void update_base_page(struct vm_area_struct *vma,
     spin_unlock(&memcg->access_lock);
 
     hot = cur_idx >= memcg->active_threshold;
+
+	if (hot) {
+		// record prediction
+		struct pebs_rec rec;
+		rec.cyc = rdtsc();
+		rec.va = address;
+		rec.ip = 0;
+		rec.cpu = 0;
+		rec.evt = 0;
+		if (memtis_pred_file) {
+			ssize_t written;
+
+			written = kernel_write(memtis_pred_file,
+						&rec,
+						sizeof(rec),
+						&memtis_pred_pos);
+			if (written != sizeof(rec))
+				pr_warn_ratelimited("htmm: pred write failed (%zd)\n",
+							written);
+		}
+	}
     
     if (PageActive(page) && !hot)
 	move_page_to_inactive_lru(page);
@@ -965,6 +1107,28 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 	return;
 
     hot = cur_idx >= memcg->active_threshold;
+
+	if (hot) {
+		// record prediction
+		struct pebs_rec rec;
+		rec.cyc = rdtsc();
+		rec.va = address;
+		rec.ip = 0;
+		rec.cpu = 0;
+		rec.evt = 0;
+		if (memtis_pred_file) {
+			ssize_t written;
+
+			written = kernel_write(memtis_pred_file,
+						&rec,
+						sizeof(rec),
+						&memtis_pred_pos);
+			if (written != sizeof(rec))
+				pr_warn_ratelimited("htmm: pred write failed (%zd)\n",
+							written);
+		}
+	}
+
     if (PageActive(page) && !hot) {
 	move_page_to_inactive_lru(page);
     } else if (!PageActive(page) && hot) {
@@ -1006,7 +1170,7 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
     if (!pginfo)
 	goto pte_unlock;
 
-    update_base_page(vma, page, pginfo);
+    update_base_page(vma, page, pginfo, address);
     pte_unmap_unlock(pte, ptl);
     if (htmm_cxl_mode) {
 	if (page_to_nid(page) == 0)

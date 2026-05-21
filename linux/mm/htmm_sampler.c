@@ -13,6 +13,8 @@
 #include <linux/cpumask.h>
 #include <linux/numa.h>
 #include <linux/err.h>
+#include <linux/vmstat.h>
+#include <linux/printk.h>
 
 #include "../kernel/events/internal.h"
 
@@ -260,7 +262,7 @@ static void pebs_disable(void)
 		memtis_trace_file = NULL;
 		memtis_trace_pos = 0;
 	}
-
+	htmm_pred_log_stop();
 	htmm_release_mem_events();
 }
 
@@ -284,6 +286,8 @@ static void pebs_enable(void)
 		return;
 	}
 	memtis_trace_pos = 0;
+	if (htmm_pred_log_start())
+		pr_warn("htmm: prediction logging disabled\n");
 
 	for_each_cpu(cpu, sample_mask) {
 	if (!mem_event[cpu])
@@ -337,6 +341,7 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
     }
 }
 
+
 static int ksamplingd(void *data)
 {
     unsigned long long nr_sampled = 0, nr_dram = 0, nr_nvm = 0, nr_write = 0;
@@ -349,12 +354,16 @@ static int ksamplingd(void *data)
     u64 total_runtime, exec_runtime, cputime = 0;
     unsigned long total_cputime, elapsed_cputime, cur;
     /* used for periodic checks*/
-    unsigned long cpucap_period = msecs_to_jiffies(15000); // 15s
+    unsigned long cpucap_period = msecs_to_jiffies(1000); // 1s
+    // unsigned long cpucap_period = msecs_to_jiffies(15000); // 15s
     unsigned long sample_period = 0;
     unsigned long sample_inst_period = 0;
     /* report cpu/period stat */
-    unsigned long trace_cputime, trace_period = msecs_to_jiffies(1500); // 3s
+    unsigned long trace_cputime, trace_period = msecs_to_jiffies(1000); // 1s
     unsigned long trace_runtime;
+    /* for tracking promotions/demotions */
+    unsigned long prev_promoted = 0, prev_demoted = 0;
+    unsigned long vm_events[NR_VM_EVENT_ITEMS];
     /* for timeout */ 
 	unsigned long sleep_timeout;
 	const struct cpumask *sample_mask;
@@ -373,6 +382,11 @@ static int ksamplingd(void *data)
 	sample_mask = htmm_sample_cpumask();
 	if (!cpumask_empty(sample_mask))
 	do_set_cpus_allowed(access_sampling, sample_mask);
+
+    /* Initialize promotion/demotion counters */
+    all_vm_events(vm_events);
+    prev_promoted = vm_events[HTMM_NR_PROMOTED];
+    prev_demoted = vm_events[HTMM_NR_DEMOTED];
 
     while (!kthread_should_stop()) {
 	int cpu, event, cond = false;
@@ -549,6 +563,7 @@ static int ksamplingd(void *data)
 	/* This is used for reporting the sample period and cputime */
 	if (cur - trace_cputime >= trace_period) {
 	    unsigned long hr = 0;
+	    unsigned long promoted_per_sec, demoted_per_sec;
 	    u64 cur_runtime = t->se.sum_exec_runtime;
 	    trace_runtime = cur_runtime - trace_runtime;
 	    trace_cputime = jiffies_to_usecs(cur - trace_cputime);
@@ -558,8 +573,15 @@ static int ksamplingd(void *data)
 		hr = 0;
 	    else
 		hr = hr_dram * 10000 / (hr_dram + hr_nvm);
-	    trace_printk("sample_period: %lu || cputime: %lu  || hit ratio: %lu\n",
-		    get_sample_period(sample_period), trace_cputime, hr);
+
+	    all_vm_events(vm_events);
+	    promoted_per_sec = vm_events[HTMM_NR_PROMOTED] - prev_promoted;
+	    demoted_per_sec = vm_events[HTMM_NR_DEMOTED] - prev_demoted;
+	    prev_promoted = vm_events[HTMM_NR_PROMOTED];
+	    prev_demoted = vm_events[HTMM_NR_DEMOTED];
+
+	    pr_info("sample_period: %lu || cputime: %lu || hit_ratio: %lu || promoted: %lu || demoted: %lu\n",
+		    get_sample_period(sample_period), trace_cputime, hr, promoted_per_sec, demoted_per_sec);
 	    
 	    hr_dram = hr_nvm = 0;
 	    trace_cputime = cur;

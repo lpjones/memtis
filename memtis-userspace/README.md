@@ -29,6 +29,23 @@ You can parse results by using "parse-results.sh"
 - Fig.10: memtis-hitratio.dat
 - Fig.11: memtis-cxl.dat
 
+## Plotting Metrics
+
+To visualize the per-second metrics logged during execution, use the plot script:
+
+```bash
+python3 plot_metrics.py results/[BENCH]/[VERSION]/[RATIO]/dmesg.txt --title "MEMTIS Metrics for [BENCH]"
+```
+
+This will create plots showing:
+- Sample period over time
+- CPU usage over time
+- DRAM hit ratio over time
+- Promotions per second
+- Demotions per second
+
+Requires: `python3`, `matplotlib`, `argparse`
+
 ## Tips for setting other systems
 ### Limits the DRAM size
 * AutoNUMA, AutoTiering, Tiering-0.8, TPP: use memmap option

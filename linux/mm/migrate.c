@@ -52,6 +52,14 @@
 #include <linux/memory.h>
 #include <linux/htmm.h>
 
+void htmm_log_page_migration(struct page *page, enum migrate_reason reason,
+			unsigned long target_nid,
+			unsigned long va) __weak;
+
+static bool htmm_log_page_migration_rmap_one(struct page *page,
+						   struct vm_area_struct *vma,
+						   unsigned long addr,
+						   void *arg);
 #include <asm/tlbflush.h>
 
 #define CREATE_TRACE_POINTS
@@ -1063,12 +1071,13 @@ out:
 }
 
 static int __unmap_and_move(struct page *page, struct page *newpage,
-				int force, enum migrate_mode mode)
+				int force, enum migrate_mode mode, enum migrate_reason reason, unsigned long private)
 {
 	int rc = -EAGAIN;
 	bool page_was_mapped = false;
 	struct anon_vma *anon_vma = NULL;
 	bool is_lru = !__PageMovable(page);
+	unsigned long va = 0;
 
 	if (!trylock_page(page)) {
 		if (!force || mode == MIGRATE_ASYNC)
@@ -1168,6 +1177,13 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 		/* Establish migration ptes */
 		VM_BUG_ON_PAGE(PageAnon(page) && !PageKsm(page) && !anon_vma,
 				page);
+		{
+			struct rmap_walk_control rwc = {
+				.arg = &va,
+				.rmap_one = htmm_log_page_migration_rmap_one,
+			};
+			rmap_walk(page, &rwc);
+		}
 		try_to_migrate(page, 0);
 		page_was_mapped = true;
 	}
@@ -1178,6 +1194,9 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 	if (page_was_mapped)
 		remove_migration_ptes(page,
 			rc == MIGRATEPAGE_SUCCESS ? newpage : page, false, false);
+
+	if (rc == MIGRATEPAGE_SUCCESS)
+		htmm_log_page_migration(page, reason, private, va);
 
 out_unlock_both:
 	unlock_page(newpage);
@@ -1294,6 +1313,25 @@ int next_promotion_node(int node)
 
     return target;
 }
+
+static bool htmm_log_page_migration_rmap_one(struct page *page,
+                                             struct vm_area_struct *vma,
+                                             unsigned long addr,
+                                             void *arg)
+{
+    unsigned long *record_va = arg;
+
+    *record_va = addr;
+    return false;
+}
+
+void __weak htmm_log_page_migration(struct page *page,
+			enum migrate_reason reason,
+			unsigned long target_nid,
+			unsigned long va)
+{
+}
+
 /*
  * Obtain the lock on page, remove all ptes and migrate the page
  * to the newly allocated page in newpage.
@@ -1328,7 +1366,7 @@ static int unmap_and_move(new_page_t get_new_page,
 	if (!newpage)
 		return -ENOMEM;
 
-	rc = __unmap_and_move(page, newpage, force, mode);
+	rc = __unmap_and_move(page, newpage, force, mode, reason, private);
 	if (rc == MIGRATEPAGE_SUCCESS)
 		set_page_owner_migrate_reason(newpage, reason);
 
