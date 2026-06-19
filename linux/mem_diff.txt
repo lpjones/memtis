@@ -1,0 +1,399 @@
+diff --git a/linux/include/linux/htmm.h b/linux/include/linux/htmm.h
+index 6bd14f11e..a7738e588 100644
+--- a/linux/include/linux/htmm.h
++++ b/linux/include/linux/htmm.h
+@@ -30,9 +30,9 @@
+ #define CXL_ACCESS_LATENCY  170
+ #define DELTA_CYCLES	(NVM_ACCESS_LATENCY - DRAM_ACCESS_LATENCY)
+ 
+-#define pcount 30
++#define HTMM_PCOUNT 30
+ /* only prime numbers */
+-static const unsigned int pebs_period_list[pcount] = {
++static const unsigned int pebs_period_list[HTMM_PCOUNT] = {
+     199,    // 200 - min
+     293,    // 300
+     401,    // 400
+@@ -111,7 +111,7 @@ extern int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *
+ 
+ extern void set_lru_adjusting(struct mem_cgroup *memcg, bool inc_thres);
+ 
+-extern void update_pginfo(pid_t pid, unsigned long address, enum events e);
++extern void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned long cyc, unsigned long ip);
+ extern int htmm_pred_log_start(void);
+ extern void htmm_pred_log_stop(void);
+ 
+@@ -147,10 +147,10 @@ extern void ksamplingd_exit(void);
+ static inline unsigned long get_sample_period(unsigned long cur) {
+     if (cur < 0)
+ 	return 0;
+-    else if (cur < pcount)
++    else if (cur < HTMM_PCOUNT)
+ 	return pebs_period_list[cur];
+     else
+-	return pebs_period_list[pcount - 1];
++	return pebs_period_list[HTMM_PCOUNT - 1];
+ }
+ 
+ static inline unsigned long get_sample_inst_period(unsigned long cur) {
+@@ -166,7 +166,7 @@ static inline void increase_sample_period(unsigned long *llc_period,
+ 					  unsigned long *inst_period) {
+     unsigned long p;
+     p = *llc_period;
+-    if (++p < pcount)
++    if (++p < HTMM_PCOUNT)
+ 	*llc_period = p;
+     
+     p = *inst_period;
+@@ -190,9 +190,9 @@ static inline unsigned int increase_sample_period(unsigned int cur,
+ 						  unsigned int next) {
+     do {
+ 	cur++;
+-    } while (pebs_period_list[cur] < next && cur < pcount);
++    } while (pebs_period_list[cur] < next && cur < HTMM_PCOUNT);
+     
+-    return cur < pcount ? cur : pcount - 1;
++    return cur < HTMM_PCOUNT ? cur : HTMM_PCOUNT - 1;
+ }
+ 
+ static inline unsigned int decrease_sample_period(unsigned int cur,
+@@ -216,3 +216,49 @@ extern unsigned long get_memcg_promotion_watermark(unsigned long max_nr_pages);
+ extern void kmigraterd_wakeup(int nid);
+ extern int kmigraterd_init(void);
+ extern void kmigraterd_stop(void);
++
++/* htmm_pagr.c */
++#ifdef CONFIG_HTMM_PAGR
++
++#define PAGR_HISTORY_SIZE           16
++#define PAGR_MAX_NEIGHBORS          4
++#define PAGR_MAX_PREDICTIONS        4
++#define PAGR_PREDICTION_DEPTH       16
++
++#define PAGR_VA_WEIGHT              1.0
++#define PAGR_CYC_WEIGHT             1.0
++#define PAGR_IP_WEIGHT              1.0
++
++#define PAGR_DEC_FAST               0.01
++#define PAGR_DEC_SLOW               0.0002
++
++struct pagr_ext {
++	struct page *page;
++	unsigned long va;
++	unsigned long cyc;
++	unsigned long ip;
++	unsigned int neighbors[PAGR_MAX_NEIGHBORS];
++	unsigned int distances[PAGR_MAX_NEIGHBORS];
++	unsigned int skewness;
++	bool in_history;
++	bool pred;
++	struct list_head pagr_pred_list;
++};
++
++extern void pagr_add_page(struct page *page, unsigned long va, unsigned long cyc, unsigned long ip);
++extern int pagr_predict_pages(struct page *page, struct page **out_predictions);
++extern void queue_pagr_prediction(struct page *page);
++extern unsigned long process_pagr_predictions(struct list_head *queue, pg_data_t *pgdat);
++
++#include <linux/page_ext.h>
++extern struct page_ext_operations htmm_pagr_ops;
++
++static inline struct pagr_ext *get_pagr_ext(struct page *page)
++{
++	struct page_ext *base = lookup_page_ext(page);
++	if (unlikely(!base))
++		return NULL;
++	return (struct pagr_ext *)((void *)base + htmm_pagr_ops.offset);
++}
++
++#endif /* CONFIG_HTMM_PAGR */
+diff --git a/linux/mm/Kconfig b/linux/mm/Kconfig
+index 164fa7128..f1651c7e5 100644
+--- a/linux/mm/Kconfig
++++ b/linux/mm/Kconfig
+@@ -908,6 +908,16 @@ config HTMM
+ 
+ 	  If in doubt, say N.
+ 
++config HTMM_PAGR
++	bool "Enable Page Access Prediction with Geometric Reasoning (PAGR) for HTMM"
++	depends on HTMM
++	select PAGE_EXTENSION
++	help
++	  Enable PAGR to predict page access patterns and promote hot pages
++	  before they trigger access thresholds in HTMM.
++
++	  If in doubt, say N.
++
+ source "mm/damon/Kconfig"
+ 
+ endmenu
+diff --git a/linux/mm/Makefile b/linux/mm/Makefile
+index 994f8d3a2..4d111a5e1 100644
+--- a/linux/mm/Makefile
++++ b/linux/mm/Makefile
+@@ -131,3 +131,4 @@ obj-$(CONFIG_IO_MAPPING) += io-mapping.o
+ obj-$(CONFIG_HAVE_BOOTMEM_INFO_NODE) += bootmem_info.o
+ obj-$(CONFIG_GENERIC_IOREMAP) += ioremap.o
+ obj-$(CONFIG_HTMM) += htmm_sampler.o htmm_core.o htmm_migrater.o
++obj-$(CONFIG_HTMM_PAGR) += htmm_pagr.o
+diff --git a/linux/mm/htmm_core.c b/linux/mm/htmm_core.c
+index 9c77225b8..ab2ccaff0 100644
+--- a/linux/mm/htmm_core.c
++++ b/linux/mm/htmm_core.c
+@@ -1141,8 +1141,7 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
+ 	move_page_to_inactive_lru(page);
+ }
+ 
+-static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
+-				unsigned long address)
++static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd, unsigned long address, unsigned long cyc, unsigned long ip)
+ {
+     pte_t *pte, ptent;
+     spinlock_t *ptl;
+@@ -1172,6 +1171,16 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
+ 
+     update_base_page(vma, page, pginfo, address);
+     pte_unmap_unlock(pte, ptl);
++#ifdef CONFIG_HTMM_PAGR
++    pagr_add_page(page, address, cyc, ip);
++    {
++        struct page *preds[PAGR_MAX_PREDICTIONS];
++        int n, i;
++        n = pagr_predict_pages(page, preds);
++        for (i = 0; i < n; i++)
++            queue_pagr_prediction(preds[i]);
++    }
++#endif
+     if (htmm_cxl_mode) {
+ 	if (page_to_nid(page) == 0)
+ 	    return 1;
+@@ -1191,7 +1200,7 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
+ }
+ 
+ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
+-				unsigned long address)
++				unsigned long address, unsigned long cyc, unsigned long ip)
+ {
+     pmd_t *pmd, pmdval;
+     bool ret = 0;
+@@ -1224,6 +1233,23 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
+ 	}
+ 
+ 	update_huge_page(vma, pmd, page, address);
++
++#ifdef CONFIG_HTMM_PAGR
++	printk("Adding PAGR hugepage: va: 0x%lx, cyc: %llu, ip: 0x%llx\n",
++			address, cyc, ip);
++	pagr_add_page(page, address, cyc, ip);
++    {
++        struct page *preds[PAGR_MAX_PREDICTIONS];
++        int n, i;
++		
++        n = pagr_predict_pages(page, preds);
++        for (i = 0; i < n; i++) {
++            queue_pagr_prediction(preds[i]);
++			printk("Hugepage prediction: %d-th pred_va: 0x%llx\n", i, preds[i]);
++		}
++    }
++#endif
++
+ 	if (htmm_cxl_mode) {
+ 	    if (page_to_nid(page) == 0)
+ 		return 1;
+@@ -1241,10 +1267,10 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
+     }
+ 
+     /* base page */
+-    return __update_pte_pginfo(vma, pmd, address);
++    return __update_pte_pginfo(vma, pmd, address, cyc, ip);
+ }
+ 
+-static int __update_pginfo(struct vm_area_struct *vma, unsigned long address)
++static int __update_pginfo(struct vm_area_struct *vma, unsigned long address, unsigned long cyc, unsigned long ip)
+ {
+     pgd_t *pgd;
+     p4d_t *p4d;
+@@ -1262,7 +1288,7 @@ static int __update_pginfo(struct vm_area_struct *vma, unsigned long address)
+     if (pud_none_or_clear_bad(pud))
+ 	return 0;
+     
+-    return __update_pmd_pginfo(vma, pud, address);
++    return __update_pmd_pginfo(vma, pud, address, cyc, ip);
+ }
+ 
+ static void set_memcg_split_thres(struct mem_cgroup *memcg)
+@@ -1492,7 +1518,7 @@ static bool need_memcg_cooling (struct mem_cgroup *memcg)
+     return false;
+ }
+ 
+-void update_pginfo(pid_t pid, unsigned long address, enum events e)
++void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned long cyc, unsigned long ip)
+ {
+     struct pid *pid_struct = find_get_pid(pid);
+     struct task_struct *p = pid_struct ? pid_task(pid_struct, PIDTYPE_PID) : NULL;
+@@ -1526,7 +1552,7 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e)
+ 	goto mmap_unlock;
+     
+     /* increase sample counts only for valid records */
+-    ret = __update_pginfo(vma, address);
++    ret = __update_pginfo(vma, address, cyc, ip);
+     if (ret == 1) { /* memory accesses to DRAM */
+ 	memcg->nr_sampled++;
+ 	memcg->nr_sampled_for_split++;
+diff --git a/linux/mm/htmm_migrater.c b/linux/mm/htmm_migrater.c
+index aed83cfc2..8855e8ace 100644
+--- a/linux/mm/htmm_migrater.c
++++ b/linux/mm/htmm_migrater.c
+@@ -1068,6 +1068,17 @@ static int kmigraterd_promotion(pg_data_t *pgdat)
+ 	    promote_node(pgdat, memcg);
+ 	}
+ 
++#ifdef CONFIG_HTMM_PAGR
++	{
++		LIST_HEAD(pagr_pages);
++		process_pagr_predictions(&pagr_pages, pgdat);
++		if (!list_empty(&pagr_pages)) {
++			migrate_page_list(&pagr_pages, pgdat, true);
++			putback_movable_pages(&pagr_pages); // in case some failed
++		}
++	}
++#endif
++
+ 	msleep_interruptible(htmm_promotion_period_in_ms);
+     }
+ 
+diff --git a/linux/mm/htmm_sampler.c b/linux/mm/htmm_sampler.c
+index c30f1d4f0..6148b75fb 100644
+--- a/linux/mm/htmm_sampler.c
++++ b/linux/mm/htmm_sampler.c
+@@ -477,7 +477,7 @@ static int ksamplingd(void *data)
+ 								    written);
+ 				}
+ 
+-			    update_pginfo(he.pid, he.addr, event);
++			    update_pginfo(he.pid, he.addr, event, rec.cyc, rec.ip);
+ 			    //count_vm_event(HTMM_NR_SAMPLED);
+ 			    nr_sampled++;
+ 
+@@ -539,7 +539,7 @@ static int ksamplingd(void *data)
+ 
+ 	    /* to prevent frequent updates, allow for a slight variation of +/- 0.5% */
+ 	    if (cputime > (ksampled_soft_cpu_quota + 5) &&
+-		    sample_period != pcount) {
++		    sample_period != HTMM_PCOUNT) {
+ 		/* need to increase the sample period */
+ 		/* only increase by 1 */
+ 		unsigned long tmp1 = sample_period, tmp2 = sample_inst_period;
+diff --git a/linux/mm/page_alloc.c b/linux/mm/page_alloc.c
+index 9c4c5ba70..e075bd049 100644
+--- a/linux/mm/page_alloc.c
++++ b/linux/mm/page_alloc.c
+@@ -59,6 +59,8 @@
+ #include <linux/mm_inline.h>
+ #include <linux/mmu_notifier.h>
+ #include <linux/migrate.h>
++#include <linux/page_ext.h>
++#include <linux/htmm.h>
+ #include <linux/hugetlb.h>
+ #include <linux/sched/rt.h>
+ #include <linux/sched/mm.h>
+@@ -2426,6 +2428,20 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
+ 	}
+ 
+ 	set_page_owner(page, order, gfp_flags);
++
++#ifdef CONFIG_HTMM_PAGR
++	{
++		int i;
++		for (i = 0; i < (1 << order); i++) {
++			struct pagr_ext *pext = get_pagr_ext(page + i);
++			if (pext) {
++				memset(pext, 0, sizeof(*pext));
++				pext->page = page + i;
++				INIT_LIST_HEAD(&pext->pagr_pred_list);
++			}
++		}
++	}
++#endif
+ }
+ 
+ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
+diff --git a/linux/mm/page_ext.c b/linux/mm/page_ext.c
+index 2a52fd9ed..f898127a1 100644
+--- a/linux/mm/page_ext.c
++++ b/linux/mm/page_ext.c
+@@ -68,6 +68,18 @@ struct page_ext_operations page_idle_ops = {
+ };
+ #endif
+ 
++#ifdef CONFIG_HTMM_PAGR
++#include <linux/htmm.h>
++static bool need_htmm_pagr(void)
++{
++	return true;
++}
++struct page_ext_operations htmm_pagr_ops = {
++	.size = sizeof(struct pagr_ext),
++	.need = need_htmm_pagr,
++};
++#endif
++
+ static struct page_ext_operations *page_ext_ops[] = {
+ #ifdef CONFIG_PAGE_OWNER
+ 	&page_owner_ops,
+@@ -75,6 +87,9 @@ static struct page_ext_operations *page_ext_ops[] = {
+ #if defined(CONFIG_PAGE_IDLE_FLAG) && !defined(CONFIG_64BIT)
+ 	&page_idle_ops,
+ #endif
++#ifdef CONFIG_HTMM_PAGR
++	&htmm_pagr_ops,
++#endif
+ };
+ 
+ unsigned long page_ext_size = sizeof(struct page_ext);
+diff --git a/memtis-userspace/scripts/run_bench.sh b/memtis-userspace/scripts/run_bench.sh
+index 2c6094a59..6648f5611 100755
+--- a/memtis-userspace/scripts/run_bench.sh
++++ b/memtis-userspace/scripts/run_bench.sh
+@@ -169,6 +169,9 @@ function func_main() {
+     sleep 2
+ 
+     ${DIR}/scripts/memory_stat.sh ${LOG_DIR} &
++
++	# cd to the working directory of the benchmark
++	# cd ${BIN_WORK_DIR}
+     if [[ "x${BENCH_NAME}" =~ "xsilo" ]]; then
+ 	${TIME} -f "execution time %e (s)" \
+ 	    ${PINNING} ${DIR}/bin/launch_bench_nopid ${BENCH_RUN} 2>&1 \
+@@ -182,6 +185,7 @@ function func_main() {
+ 	    ${PINNING} ${DIR}/bin/launch_bench ${BENCH_RUN} 2>&1 \
+ 	    | tee ${LOG_DIR}/output.log
+     fi
++	# cd -
+ 
+     sudo killall -9 memory_stat.sh
+     cat /proc/vmstat | grep -e thp -e htmm -e pgmig > ${LOG_DIR}/after_vmstat.log
+@@ -365,6 +369,19 @@ function func_plot() {
+     #     --tw 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1
+ }
+ 
++function func_trace() {
++	local app_dir=${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/
++	local start_perc=$1; shift
++	local end_perc=$1; shift
++
++	$py_bin $plot_dir/plot_cluster_no_app.py \
++		${app_dir}memtis_pebs_trace.bin \
++		--output ${app_dir}plot.png \
++		--start-percent ${start_perc} \
++		--end-percent ${end_perc}
++}
++
+ func_prepare
+ func_main
+-func_plot
+\ No newline at end of file
++func_plot
++# func_trace 50 50.5
+\ No newline at end of file

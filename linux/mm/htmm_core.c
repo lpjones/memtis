@@ -970,7 +970,7 @@ lru_unlock:
 	BUG();
 }
 
-static void update_base_page(struct vm_area_struct *vma,
+static bool update_base_page(struct vm_area_struct *vma,
 	struct page *page, pginfo_t *pginfo, unsigned long address)
 {
     struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
@@ -1010,27 +1010,6 @@ static void update_base_page(struct vm_area_struct *vma,
 
     hot = cur_idx >= memcg->active_threshold;
 
-	if (hot) {
-		// record prediction
-		struct pebs_rec rec;
-		rec.cyc = rdtsc();
-		rec.va = address;
-		rec.ip = 0;
-		rec.cpu = 0;
-		rec.evt = 0;
-		if (memtis_pred_file) {
-			ssize_t written;
-
-			written = kernel_write(memtis_pred_file,
-						&rec,
-						sizeof(rec),
-						&memtis_pred_pos);
-			if (written != sizeof(rec))
-				pr_warn_ratelimited("htmm: pred write failed (%zd)\n",
-							written);
-		}
-	}
-    
     if (PageActive(page) && !hot)
 	move_page_to_inactive_lru(page);
     else if (!PageActive(page) && hot)
@@ -1040,9 +1019,11 @@ static void update_base_page(struct vm_area_struct *vma,
 	move_page_to_active_lru(page);
     else if (PageActive(page))
 	move_page_to_inactive_lru(page);
+
+    return hot;
 }
 
-static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
+static bool update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 	struct page *page, unsigned long address)
 {
     struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
@@ -1104,30 +1085,9 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
     meta_page->idx = cur_idx;
 
     if (pg_split)
-	return;
+	return false;
 
     hot = cur_idx >= memcg->active_threshold;
-
-	if (hot) {
-		// record prediction
-		struct pebs_rec rec;
-		rec.cyc = rdtsc();
-		rec.va = address;
-		rec.ip = 0;
-		rec.cpu = 0;
-		rec.evt = 0;
-		if (memtis_pred_file) {
-			ssize_t written;
-
-			written = kernel_write(memtis_pred_file,
-						&rec,
-						sizeof(rec),
-						&memtis_pred_pos);
-			if (written != sizeof(rec))
-				pr_warn_ratelimited("htmm: pred write failed (%zd)\n",
-							written);
-		}
-	}
 
     if (PageActive(page) && !hot) {
 	move_page_to_inactive_lru(page);
@@ -1139,6 +1099,8 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 	move_page_to_active_lru(page);
     else if (PageActive(page))
 	move_page_to_inactive_lru(page);
+
+    return hot;
 }
 
 static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
@@ -1149,6 +1111,7 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
     pginfo_t *pginfo;
     struct page *page, *pte_page;
     int ret = 0;
+    bool hot = false;
 
     pte = pte_offset_map_lock(vma->vm_mm, pmd, address, &ptl);
     ptent = *pte;
@@ -1170,8 +1133,28 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
     if (!pginfo)
 	goto pte_unlock;
 
-    update_base_page(vma, page, pginfo, address);
+    hot = update_base_page(vma, page, pginfo, address);
     pte_unmap_unlock(pte, ptl);
+
+    if (hot) {
+	struct pebs_rec rec;
+	rec.cyc = rdtsc();
+	rec.va = address;
+	rec.ip = 0;
+	rec.cpu = 0;
+	rec.evt = 0;
+	if (memtis_pred_file) {
+		ssize_t written;
+
+		written = kernel_write(memtis_pred_file,
+					&rec,
+					sizeof(rec),
+					&memtis_pred_pos);
+		if (written != sizeof(rec))
+			pr_warn_ratelimited("htmm: pred write failed (%zd)\n",
+						written);
+	}
+    }
     if (htmm_cxl_mode) {
 	if (page_to_nid(page) == 0)
 	    return 1;
@@ -1211,6 +1194,7 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
     pmdval = *pmd;
     if (pmd_trans_huge(pmdval) || pmd_devmap(pmdval)) {
 	struct page *page;
+	bool hot = false;
 
 	if (is_huge_zero_pmd(pmdval))
 	    return ret;
@@ -1223,18 +1207,38 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 	    goto pmd_unlock;
 	}
 
-	update_huge_page(vma, pmd, page, address);
+	hot = update_huge_page(vma, pmd, page, address);
+	if (hot) {
+		struct pebs_rec rec;
+		rec.cyc = rdtsc();
+		rec.va = address;
+		rec.ip = 0;
+		rec.cpu = 0;
+		rec.evt = 0;
+		if (memtis_pred_file) {
+			ssize_t written;
+
+			written = kernel_write(memtis_pred_file,
+						&rec,
+						sizeof(rec),
+						&memtis_pred_pos);
+			if (written != sizeof(rec))
+				pr_warn_ratelimited("htmm: pred write failed (%zd)\n",
+							written);
+		}
+	}
+
 	if (htmm_cxl_mode) {
 	    if (page_to_nid(page) == 0)
-		return 1;
+			return 1;
 	    else
-		return 2;
+			return 2;
 	}
 	else {
 	    if (node_is_toptier(page_to_nid(page)))
-		return 1;
+			return 1;
 	    else
-		return 2;
+			return 2;
 	}
 pmd_unlock:
 	return 0;

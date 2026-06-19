@@ -2830,17 +2830,22 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 #ifdef CONFIG_HTMM
 		{
 		    struct mem_cgroup *memcg = page_memcg(head);
-		    unsigned int idx;
 
-		    spin_lock(&memcg->access_lock);
-		    idx = head[3].idx;
+		    if (memcg && memcg->htmm_enabled && PageHtmm(&head[3])) {
+				unsigned int idx;
 
-		    if (memcg->hotness_hg[idx] < HPAGE_PMD_NR)
-			memcg->hotness_hg[idx] = 0;
-		    else
-			memcg->hotness_hg[idx] -= HPAGE_PMD_NR;
+				spin_lock(&memcg->access_lock);
+				idx = head[3].idx;
 
-		    spin_unlock(&memcg->access_lock);
+				if (idx < 16) {
+					if (memcg->hotness_hg[idx] < HPAGE_PMD_NR)
+					memcg->hotness_hg[idx] = 0;
+					else
+					memcg->hotness_hg[idx] -= HPAGE_PMD_NR;
+				}
+
+				spin_unlock(&memcg->access_lock);
+		    }
 		}
 #endif
 		__split_huge_page(page, list, end);
