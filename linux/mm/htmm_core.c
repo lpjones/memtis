@@ -3,6 +3,7 @@
  * mail: taehyunggg@skku.edu
  */
 #include <linux/mm.h>
+#include <linux/page_ext.h>
 #include <linux/kernel.h>
 #include <linux/huge_mm.h>
 #include <linux/mm_inline.h>
@@ -532,8 +533,7 @@ unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
 
     list_for_each_safe(pos, next, &list) {
 	LIST_HEAD(tmp);
-	struct lruvec *lruvec = mem_cgroup_page_lruvec(page);
-	bool skip_iso = false;
+	struct lruvec *lruvec;
 
 	if (split >= nr_max)
 	    break;
@@ -542,10 +542,10 @@ unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
 	page = compound_head(page);
 
 	if (!PageLRU(page)) {
-	    skip_iso = true;
-	    goto skip_isolation;
+	    continue;
 	}
 
+	lruvec = mem_cgroup_page_lruvec(page);
 	if (lruvec != &pn->lruvec) {
 	    continue;
 	}
@@ -570,14 +570,11 @@ unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
 	list_move(&page->lru, &tmp);
 	update_lru_size(lruvec, page_lru(page), page_zonenum(page),
 		    -thp_nr_pages(page));
+	__mod_node_page_state(page_pgdat(page),
+			NR_ISOLATED_ANON + page_is_file_lru(page),
+			thp_nr_pages(page));
 	spin_unlock_irq(&lruvec->lru_lock);
-skip_isolation:
-	if (skip_iso) {
-	    if (page->lru.next != LIST_POISON1 || page->lru.prev != LIST_POISON2)
-		continue;
-	    list_add(&page->lru, &tmp);
-	}
-	
+
 	if (!trylock_page(page)) {
 	    list_splice_tail(&tmp, split_list);
 	    continue;
@@ -614,6 +611,10 @@ void putback_split_pages(struct list_head *split_list, struct lruvec *lruvec)
 
 	page = lru_to_page(split_list);
 	list_del(&page->lru);
+
+	__mod_node_page_state(page_pgdat(page),
+			NR_ISOLATED_ANON + page_is_file_lru(page),
+			-thp_nr_pages(page));
 
 	if (unlikely(!page_evictable(page))) {
 	    putback_lru_page(page);
@@ -1104,7 +1105,7 @@ static bool update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 }
 
 static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
-				unsigned long address)
+				unsigned long address, unsigned long cyc, unsigned long ip)
 {
     pte_t *pte, ptent;
     spinlock_t *ptl;
@@ -1121,6 +1122,19 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
     page = vm_normal_page(vma, address, ptent);
     if (!page || PageKsm(page))
 	goto pte_unlock;
+
+#ifdef CONFIG_HTMM_PAGR
+    {
+        struct pagr_ext *pext = get_pagr_ext(page);
+        if (pext) {
+            pext->last_va = address;
+            pext->last_ip = ip;
+            pext->last_cyc = cyc;
+            printk_ratelimited(KERN_INFO "htmm_pagr: basepage pfn %lu accessed: va=0x%lx, ip=0x%lx, cyc=%lu\n",
+                               page_to_pfn(page), pext->last_va, pext->last_ip, pext->last_cyc);
+        }
+    }
+#endif
 
     if (page != compound_head(page))
 	goto pte_unlock;
@@ -1174,7 +1188,7 @@ pte_unlock:
 }
 
 static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
-				unsigned long address)
+				unsigned long address, unsigned long cyc, unsigned long ip)
 {
     pmd_t *pmd, pmdval;
     bool ret = 0;
@@ -1206,6 +1220,19 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 	if (!PageCompound(page)) {
 	    goto pmd_unlock;
 	}
+
+#ifdef CONFIG_HTMM_PAGR
+	{
+		struct pagr_ext *pext = get_pagr_ext(page);
+		if (pext) {
+			pext->last_va = address;
+			pext->last_ip = ip;
+			pext->last_cyc = cyc;
+			printk_ratelimited(KERN_INFO "htmm_pagr: hugepage pfn %lu accessed: va=0x%lx, ip=0x%lx, cyc=%lu\n",
+					   page_to_pfn(page), pext->last_va, pext->last_ip, pext->last_cyc);
+		}
+	}
+#endif
 
 	hot = update_huge_page(vma, pmd, page, address);
 	if (hot) {
@@ -1245,10 +1272,10 @@ pmd_unlock:
     }
 
     /* base page */
-    return __update_pte_pginfo(vma, pmd, address);
+    return __update_pte_pginfo(vma, pmd, address, cyc, ip);
 }
 
-static int __update_pginfo(struct vm_area_struct *vma, unsigned long address)
+static int __update_pginfo(struct vm_area_struct *vma, unsigned long address, unsigned long cyc, unsigned long ip)
 {
     pgd_t *pgd;
     p4d_t *p4d;
@@ -1266,7 +1293,7 @@ static int __update_pginfo(struct vm_area_struct *vma, unsigned long address)
     if (pud_none_or_clear_bad(pud))
 	return 0;
     
-    return __update_pmd_pginfo(vma, pud, address);
+    return __update_pmd_pginfo(vma, pud, address, cyc, ip);
 }
 
 static void set_memcg_split_thres(struct mem_cgroup *memcg)
@@ -1496,7 +1523,7 @@ static bool need_memcg_cooling (struct mem_cgroup *memcg)
     return false;
 }
 
-void update_pginfo(pid_t pid, unsigned long address, enum events e)
+void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned long cyc, unsigned long ip)
 {
     struct pid *pid_struct = find_get_pid(pid);
     struct task_struct *p = pid_struct ? pid_task(pid_struct, PIDTYPE_PID) : NULL;
@@ -1530,7 +1557,7 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e)
 	goto mmap_unlock;
     
     /* increase sample counts only for valid records */
-    ret = __update_pginfo(vma, address);
+    ret = __update_pginfo(vma, address, cyc, ip);
     if (ret == 1) { /* memory accesses to DRAM */
 	memcg->nr_sampled++;
 	memcg->nr_sampled_for_split++;

@@ -17,6 +17,7 @@
 
 #include <linux/stddef.h>
 #include <linux/mm.h>
+#include <linux/page_ext.h>
 #include <linux/highmem.h>
 #include <linux/swap.h>
 #include <linux/interrupt.h>
@@ -2426,6 +2427,20 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 	}
 
 	set_page_owner(page, order, gfp_flags);
+
+#ifdef CONFIG_HTMM_PAGR
+	{
+		int i;
+		for (i = 0; i < (1 << order); i++) {
+			struct pagr_ext *pext = get_pagr_ext(page + i);
+			if (pext) {
+				pext->last_cyc = 0;
+				pext->last_va = 0;
+				pext->last_ip = 0;
+			}
+		}
+	}
+#endif
 }
 
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,

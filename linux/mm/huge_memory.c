@@ -2442,10 +2442,11 @@ static void __split_huge_page_tail(struct page *head, int tail,
 #ifdef CONFIG_HTMM
 	if (htmm_tail)
 	    clear_transhuge_pginfo(page_tail);
+	
 	if (htmm_active_tail)
-	    SetPageActive(page_tail);
+		SetPageActive(page_tail);
 	else
-	    ClearPageActive(page_tail);
+		ClearPageActive(page_tail);
 #endif
 	page_tail->mapping = head->mapping;
 	page_tail->index = head->index + tail;

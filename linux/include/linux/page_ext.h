@@ -6,6 +6,14 @@
 #include <linux/stacktrace.h>
 #include <linux/stackdepot.h>
 
+#ifdef CONFIG_HTMM_PAGR
+struct pagr_ext {
+	unsigned long last_cyc;
+	unsigned long last_va;
+	unsigned long last_ip;
+};
+#endif
+
 struct pglist_data;
 struct page_ext_operations {
 	size_t offset;
@@ -57,6 +65,18 @@ static inline void page_ext_init(void)
 
 struct page_ext *lookup_page_ext(const struct page *page);
 
+#ifdef CONFIG_HTMM_PAGR
+extern struct page_ext_operations page_pagr_ops;
+
+static inline struct pagr_ext *get_pagr_ext(const struct page *page)
+{
+	struct page_ext *base = lookup_page_ext(page);
+	if (unlikely(!base))
+		return NULL;
+	return (struct pagr_ext *)((void *)base + page_pagr_ops.offset);
+}
+#endif
+
 static inline struct page_ext *page_ext_next(struct page_ext *curr)
 {
 	void *next = curr;
@@ -66,6 +86,13 @@ static inline struct page_ext *page_ext_next(struct page_ext *curr)
 
 #else /* !CONFIG_PAGE_EXTENSION */
 struct page_ext;
+
+#ifdef CONFIG_HTMM_PAGR
+static inline struct pagr_ext *get_pagr_ext(const struct page *page)
+{
+	return NULL;
+}
+#endif
 
 static inline void pgdat_page_ext_init(struct pglist_data *pgdat)
 {

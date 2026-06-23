@@ -908,6 +908,14 @@ config HTMM
 
 	  If in doubt, say N.
 
+config HTMM_PAGR
+	bool "Enable PAGR metadata tracking"
+	depends on HTMM
+	select PAGE_EXTENSION
+	default y
+	help
+	  Enable PAGR metadata tracking in page_ext.
+
 source "mm/damon/Kconfig"
 
 endmenu

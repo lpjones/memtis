@@ -111,7 +111,7 @@ extern int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *
 
 extern void set_lru_adjusting(struct mem_cgroup *memcg, bool inc_thres);
 
-extern void update_pginfo(pid_t pid, unsigned long address, enum events e);
+extern void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned long cyc, unsigned long ip);
 extern int htmm_pred_log_start(void);
 extern void htmm_pred_log_stop(void);
 
