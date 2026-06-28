@@ -97,7 +97,10 @@
 #include <linux/scs.h>
 #include <linux/io_uring.h>
 #include <linux/bpf.h>
+
+#ifdef CONFIG_HTMM
 #include <linux/htmm.h>
+#endif
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>

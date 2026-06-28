@@ -50,7 +50,10 @@
 #include <linux/ptrace.h>
 #include <linux/oom.h>
 #include <linux/memory.h>
+
+#ifdef CONFIG_HTMM
 #include <linux/htmm.h>
+#endif
 
 void htmm_log_page_migration(struct page *page, enum migrate_reason reason,
 			unsigned long target_nid,

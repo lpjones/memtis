@@ -68,7 +68,9 @@
 #include "slab.h"
 
 #include <linux/mempolicy.h>
+#ifdef CONFIG_HTMM
 #include <linux/htmm.h>
+#endif
 #include <linux/uaccess.h>
 
 #include <trace/events/vmscan.h>

@@ -34,7 +34,10 @@
 #include <linux/oom.h>
 #include <linux/numa.h>
 #include <linux/page_owner.h>
+
+#ifdef CONFIG_HTMM
 #include <linux/htmm.h>
+#endif
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
