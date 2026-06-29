@@ -11,8 +11,6 @@
 #include <linux/mm_inline.h>
 #include "internal.h"
 
-#ifdef CONFIG_HTMM_PAGR
-
 #define ABS(x) ((x) >= 0 ? (x) : -(x))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -271,5 +269,3 @@ unsigned long process_pagr_predictions(struct list_head *out_list, pg_data_t *pg
 
     return isolated;
 }
-
-#endif /* CONFIG_HTMM_PAGR */

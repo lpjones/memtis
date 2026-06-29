@@ -284,6 +284,14 @@ typedef struct { pgdval_t pgd; } pgd_t;
 #ifdef CONFIG_HTMM /* pginfo_t */
 typedef struct { uint32_t total_accesses; uint16_t nr_accesses; uint8_t cooling_clock; bool may_hot; } pginfo_t;
 #endif
+#ifdef CONFIG_PAGR
+typedef struct {
+	struct page *neighbor;
+	unsigned long distance;	/* 10000x (12345 = 1.2345)*/
+	unsigned long time_diff;
+} pginfo_t;
+#endif
+
 
 static inline pgprot_t pgprot_nx(pgprot_t prot)
 {

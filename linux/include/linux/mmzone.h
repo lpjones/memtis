@@ -886,7 +886,7 @@ typedef struct pglist_data {
 	struct deferred_split deferred_split_queue;
 #endif
 
-#ifdef CONFIG_HTMM /* struct pglist_data */
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR) /* struct pglist_data */
 	struct cftype *memcg_htmm_file; /* max, terminate. */
 	struct task_struct  *kmigraterd;
 	struct list_head    kmigraterd_head;

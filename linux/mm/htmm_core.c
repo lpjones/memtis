@@ -1123,19 +1123,6 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
     if (!page || PageKsm(page))
 	goto pte_unlock;
 
-#ifdef CONFIG_HTMM_PAGR
-    {
-        struct pagr_ext *pext = get_pagr_ext(page);
-        if (pext) {
-            pext->last_va = address;
-            pext->last_ip = ip;
-            pext->last_cyc = cyc;
-            printk_ratelimited(KERN_INFO "htmm_pagr: basepage pfn %lu accessed: va=0x%lx, ip=0x%lx, cyc=%lu\n",
-                               page_to_pfn(page), pext->last_va, pext->last_ip, pext->last_cyc);
-        }
-    }
-#endif
-
     if (page != compound_head(page))
 	goto pte_unlock;
 
@@ -1220,19 +1207,6 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 	if (!PageCompound(page)) {
 	    goto pmd_unlock;
 	}
-
-#ifdef CONFIG_HTMM_PAGR
-	{
-		struct pagr_ext *pext = get_pagr_ext(page);
-		if (pext) {
-			pext->last_va = address;
-			pext->last_ip = ip;
-			pext->last_cyc = cyc;
-			printk_ratelimited(KERN_INFO "htmm_pagr: hugepage pfn %lu accessed: va=0x%lx, ip=0x%lx, cyc=%lu\n",
-					   page_to_pfn(page), pext->last_va, pext->last_ip, pext->last_cyc);
-		}
-	}
-#endif
 
 	hot = update_huge_page(vma, pmd, page, address);
 	if (hot) {

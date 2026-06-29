@@ -58,6 +58,9 @@
 #ifdef CONFIG_HTMM /* include header */
 #include <linux/htmm.h>
 #endif
+#ifdef CONFIG_PAGR
+#include <linux/pagr.h>
+#endif
 
 #include "internal.h"
 
@@ -12498,7 +12501,7 @@ err_fd:
 	return err;
 }
 
-#ifndef CONFIG_HTMM
+#if !(defined(CONFIG_HTMM) || defined(CONFIG_PAGR))
 SYSCALL_DEFINE2(htmm_start,
 		pid_t, pid, int, node)
 {

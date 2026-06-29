@@ -54,6 +54,9 @@
 #ifdef CONFIG_HTMM
 #include <linux/htmm.h>
 #endif
+#ifdef CONFIG_PAGR
+#include <linux/pagr.h>
+#endif
 
 void htmm_log_page_migration(struct page *page, enum migrate_reason reason,
 			unsigned long target_nid,

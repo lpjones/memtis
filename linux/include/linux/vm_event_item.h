@@ -113,7 +113,7 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
 		BALLOON_MIGRATE,
 #endif
 #endif
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 		HTMM_NR_PROMOTED,
 		HTMM_NR_DEMOTED,
 		HTMM_NR_SAMPLED,

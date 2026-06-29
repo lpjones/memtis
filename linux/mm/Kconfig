@@ -908,13 +908,12 @@ config HTMM
 
 	  If in doubt, say N.
 
-config HTMM_PAGR
+config PAGR
 	bool "Enable PAGR metadata tracking"
-	depends on HTMM
-	select PAGE_EXTENSION
+	depends on MIGRATION && TRANSPARENT_HUGEPAGE
 	default y
 	help
-	  Enable PAGR metadata tracking in page_ext.
+	  Enable PAGR metadata tracking.
 
 source "mm/damon/Kconfig"
 

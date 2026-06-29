@@ -68,26 +68,12 @@ struct page_ext_operations page_idle_ops = {
 };
 #endif
 
-#ifdef CONFIG_HTMM_PAGR
-static bool need_page_pagr(void)
-{
-	return true;
-}
-struct page_ext_operations page_pagr_ops = {
-	.need = need_page_pagr,
-	.size = sizeof(struct pagr_ext),
-};
-#endif
-
 static struct page_ext_operations *page_ext_ops[] = {
 #ifdef CONFIG_PAGE_OWNER
 	&page_owner_ops,
 #endif
 #if defined(CONFIG_PAGE_IDLE_FLAG) && !defined(CONFIG_64BIT)
 	&page_idle_ops,
-#endif
-#ifdef CONFIG_HTMM_PAGR
-	&page_pagr_ops,
 #endif
 };
 

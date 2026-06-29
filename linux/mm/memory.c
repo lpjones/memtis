@@ -77,6 +77,9 @@
 #ifdef CONFIG_HTMM
 #include <linux/htmm.h>
 #endif
+#ifdef CONFIG_PAGR
+#include <linux/pagr.h>
+#endif
 
 #include <trace/events/kmem.h>
 

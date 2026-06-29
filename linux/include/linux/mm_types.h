@@ -94,6 +94,7 @@ struct page {
 			 * Indicates order in the buddy system if PageBuddy.
 			 */
 			unsigned long private;
+			/* 0 bytes left */
 		};
 		struct {	/* page_pool used by netstack */
 			/**
@@ -174,6 +175,25 @@ struct page {
 		struct {	/* Fourth~ tail pages of compound page */
 			unsigned long ___compound_pad_1;/* compound_head */
 			pginfo_t compound_pginfo[4];	/* 32 bytes */
+		};
+#endif
+
+#ifdef CONFIG_HTMM_PAGR
+		struct {	/* Third~ tail pages of compound page */
+			unsigned long __compound_pad_1; /* compound_head */
+			/* 32 bytes left */
+			union {
+				struct {	/* Third tail page of compound page */
+					unsigned long last_va;
+					unsigned long last_cyc;
+					unsigned long last_ip;
+					/* 8 bytes left */
+				};
+				struct {	/* Fourth~ tail pages of compound page */
+					pginfo_t pagr_info;
+					/* 8 bytes left */
+				};
+			};
 		};
 #endif
 		struct {	/* Page table pages */
@@ -605,7 +625,7 @@ struct mm_struct {
 		u32 pasid;
 #endif
 
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 		bool htmm_enabled;
 #endif
 	} __randomize_layout;

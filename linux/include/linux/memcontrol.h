@@ -141,7 +141,7 @@ struct mem_cgroup_per_node {
 	struct lruvec_stats			lruvec_stats;
 
 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
-#ifdef CONFIG_HTMM /* struct mem_cgroup_per_node */
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR) /* struct mem_cgroup_per_node */
 	unsigned long		max_nr_base_pages; /* Set by "max_at_node" param */
 	struct list_head	kmigraterd_list;
 	bool			need_cooling;
@@ -356,7 +356,7 @@ struct mem_cgroup {
 	struct deferred_split deferred_split_queue;
 #endif
 
-#ifdef CONFIG_HTMM /* struct mem_cgroup */
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR) /* struct mem_cgroup */
 	bool htmm_enabled;
 	unsigned long max_nr_dram_pages; /* the maximum number of pages */
 	unsigned long nr_active_pages; /* updated by need_lru_cooling() */
@@ -1797,7 +1797,7 @@ static inline struct mem_cgroup *mem_cgroup_from_obj(void *p)
 
 #endif /* CONFIG_MEMCG_KMEM */
 
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 extern int mem_cgroup_per_node_htmm_init(void);
 #endif
 #endif /* _LINUX_MEMCONTROL_H */

@@ -78,6 +78,11 @@
 #include <linux/random.h>
 #include <linux/htmm.h>
 #endif
+#ifdef CONFIG_PAGR
+#include <linux/random.h>
+#include <linux/pagr.h>
+#endif
+
 #include <asm/tlbflush.h>
 
 #include <trace/events/tlb.h>

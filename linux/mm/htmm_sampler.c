@@ -540,7 +540,7 @@ static int ksamplingd(void *data)
 
 	    /* to prevent frequent updates, allow for a slight variation of +/- 0.5% */
 	    if (cputime > (ksampled_soft_cpu_quota + 5) &&
-		    sample_period != pcount) {
+		    sample_period != HTMM_PCOUNT) {
 		/* need to increase the sample period */
 		/* only increase by 1 */
 		unsigned long tmp1 = sample_period, tmp2 = sample_inst_period;

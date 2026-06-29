@@ -1616,7 +1616,7 @@ extern void __weak arch_perf_update_userpage(struct perf_event *event,
 extern __weak u64 arch_perf_get_page_size(struct mm_struct *mm, unsigned long addr);
 #endif
 
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 extern int htmm__perf_event_init(struct perf_event *event, unsigned long nr_pages);
 extern int htmm__perf_event_open(struct perf_event_attr *attr_ptr, pid_t pid,
 	int cpu, int group_fd, unsigned long flags);

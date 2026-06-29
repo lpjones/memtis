@@ -38,6 +38,9 @@
 #ifdef CONFIG_HTMM
 #include <linux/htmm.h>
 #endif
+#ifdef CONFIG_PAGR
+#include <linux/pagr.h>
+#endif
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
@@ -509,7 +512,7 @@ struct deferred_split *get_deferred_split_queue(struct page *page)
 	struct pglist_data *pgdat = NODE_DATA(page_to_nid(page));
 
 	if (memcg)
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	{
 		if (memcg->htmm_enabled) {
 			struct mem_cgroup_per_node *pn = memcg->nodeinfo[page_to_nid(page)];
@@ -672,7 +675,7 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
 		spin_unlock(vmf->ptl);
 		count_vm_event(THP_FAULT_ALLOC);
 		count_memcg_event_mm(vma->vm_mm, THP_FAULT_ALLOC);
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 		if (page != NULL && node_is_toptier(page_to_nid(page)))
 		    count_vm_events(HTMM_ALLOC_DRAM, HPAGE_PMD_NR);
 		else
@@ -800,7 +803,7 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 		count_vm_event(THP_FAULT_FALLBACK);
 		return VM_FAULT_FALLBACK;
 	}
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	prep_transhuge_page_for_htmm(vma, page);
 #else
 	prep_transhuge_page(page);
@@ -1635,7 +1638,7 @@ int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 
 		if (pmd_present(orig_pmd)) {
 			page = pmd_page(orig_pmd);
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 			uncharge_htmm_page(page, get_mem_cgroup_from_mm(vma->vm_mm));
 #endif
 			page_remove_rmap(page, true);
@@ -2133,7 +2136,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 			atomic_inc(&page[i]._mapcount);
 		pte_unmap(pte);
 	}
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	/* pginfo-s managed by the huge page should be copied into pte->pginfo*/
 	if (PageHtmm(&page[3])) {
 	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
@@ -2404,7 +2407,7 @@ static void __split_huge_page_tail(struct page *head, int tail,
 		struct lruvec *lruvec, struct list_head *list)
 {
 	struct page *page_tail = head + tail;
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	bool htmm_tail = PageHtmm(page_tail) ? true : false;
 	bool htmm_active_tail = PageHtmm(head) && PageActive(page_tail);
 #else
@@ -2442,7 +2445,7 @@ static void __split_huge_page_tail(struct page *head, int tail,
 	//VM_BUG_ON_PAGE(tail > 2 && !PageHtmm(head) && !htmm_tail && page_tail->mapping != TAIL_MAPPING,
 //			page_tail);
 
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	if (htmm_tail)
 	    clear_transhuge_pginfo(page_tail);
 	
@@ -2529,7 +2532,7 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 					head + i, 0);
 		}
 	}
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	ClearPageHtmm(head);
 #endif
 	ClearPageCompound(head);
@@ -2831,7 +2834,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 				filemap_nr_thps_dec(mapping);
 			}
 		}
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 		{
 		    struct mem_cgroup *memcg = page_memcg(head);
 
@@ -2966,7 +2969,7 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
 #ifdef CONFIG_MEMCG
 	if (sc->memcg)
 		ds_queue = &sc->memcg->deferred_split_queue;
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	if (sc->memcg) {
 	    int nid, nr_nonempty = 0;
 	    
@@ -3017,7 +3020,7 @@ next:
 	return split;
 #endif
 #endif
-#ifndef CONFIG_HTMM
+#if !(defined(CONFIG_HTMM) || defined(CONFIG_PAGR))
 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
 	/* Take pin on all head pages to avoid freeing them under us */
 	list_for_each_safe(pos, next, &ds_queue->split_queue) {
@@ -3406,7 +3409,7 @@ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
 	else
 		page_add_file_rmap(new, true);
 	set_pmd_at(mm, mmun_start, pvmw->pmd, pmde);
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	{
 	    check_transhuge_cooling(NULL, new, true);
 	}
