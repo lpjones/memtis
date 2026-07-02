@@ -1,5 +1,5 @@
 #include <linux/mm.h>
-#include <linux/htmm.h>
+#include <linux/pagr.h>
 #include <linux/page_ext.h>
 #include <linux/spinlock.h>
 #include <linux/jiffies.h>

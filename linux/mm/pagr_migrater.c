@@ -13,7 +13,7 @@
 #include <linux/rmap.h>
 #include <linux/delay.h>
 #include <linux/node.h>
-#include <linux/htmm.h>
+#include <linux/pagr.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
 
@@ -389,6 +389,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 	    goto keep_locked;
 
 	if (htmm_nowarm == 0 && PageAnon(page)) {
+#ifdef CONFIG_HTMM
 	    if (PageTransHuge(page)) {
 		struct page *meta = get_meta_page(page);
 
@@ -400,6 +401,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 		if (idx >= memcg->warm_threshold)
 		    goto keep_locked;
 	    }
+#endif
 	}
 
 	unlock_page(page);
@@ -694,7 +696,9 @@ static unsigned long cooling_active_list(unsigned long nr_to_scan,
 	    int still_hot;
 
 	    if (PageTransHuge(compound_head(page))) {
+#ifdef CONFIG_HTMM
 		struct page *meta = get_meta_page(page);
+#endif
 
 #ifdef DEFERRED_SPLIT_ISOLATED
 		if (check_split_huge_page(memcg, get_meta_page(page), false)) {
@@ -702,7 +706,9 @@ static unsigned long cooling_active_list(unsigned long nr_to_scan,
 		    spin_lock_irq(&lruvec->lru_lock);
 		    if (deferred_split_huge_page_for_htmm(compound_head(page))) {
 			spin_unlock_irq(&lruvec->lru_lock);
+#ifdef CONFIG_HTMM
 			check_transhuge_cooling((void *)memcg, page, false);
+#endif
 			/* Page was isolated (lru_size decremented, isolation ref held).
 			 * putback_lru_page restores lru_size and drops the iso ref. */
 			putback_lru_page(page);
@@ -711,15 +717,23 @@ static unsigned long cooling_active_list(unsigned long nr_to_scan,
 		    spin_unlock_irq(&lruvec->lru_lock);
 		}
 #endif
+#ifdef CONFIG_HTMM
 		check_transhuge_cooling((void *)memcg, page, false);
 
 		if (meta->idx >= memcg->active_threshold)
 		    still_hot = 2;
 		else
 		    still_hot = 1;
+#else
+		still_hot = 1;
+#endif
 	    }
 	    else {
+#ifdef CONFIG_HTMM
 		still_hot = cooling_page(page, lruvec_memcg(lruvec));
+#else
+		still_hot = 1;
+#endif
 	    }
 
 	    if (still_hot == 2) {
@@ -850,16 +864,22 @@ static unsigned long adjusting_lru_list(unsigned long nr_to_scan,
 	}
 #endif
 	if (PageTransHuge(compound_head(page))) {
+#ifdef CONFIG_HTMM
 	    struct page *meta = get_meta_page(page);
 	    
 	    if (meta->idx >= memcg->active_threshold)
 		status = 2;
 	    else
+#endif
 		status = 1;
 	    nr_split_hot++;
 	}
 	else {
+#ifdef CONFIG_HTMM
 	    status = page_check_hotness(page, memcg);
+#else
+	    status = 1;
+#endif
 	    nr_split_cand++;
 	}
 	

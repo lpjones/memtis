@@ -2107,7 +2107,7 @@ struct page *alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
 		goto out;
 	}
 
-#ifdef CONFIG_HTMM /* alloc_pages_vma() */
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR) /* alloc_pages_vma() */
     if (vma->vm_mm && vma->vm_mm->htmm_enabled) {
 	    struct task_struct *p = current;
 	    struct mem_cgroup *memcg = mem_cgroup_from_task(p);
@@ -3030,7 +3030,7 @@ void mpol_to_str(char *buffer, int maxlen, struct mempolicy *pol)
 }
 
 bool numa_demotion_enabled = false;
-#ifdef CONFIG_HTMM /* sysfs htmm */
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR) /* sysfs htmm */
 unsigned int htmm_sample_period = 199;
 unsigned int htmm_inst_sample_period = 100007;
 unsigned int htmm_thres_hot = 1;
@@ -3109,7 +3109,7 @@ delete_obj:
 	return err;
 }
 subsys_initcall(numa_init_sysfs);
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 static ssize_t htmm_sample_period_show(struct kobject *kobj,
 				   struct kobj_attribute *attr, char *buf)
 {

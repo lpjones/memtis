@@ -1095,7 +1095,7 @@ static int collapse_huge_page(struct mm_struct *mm,
 	 * that. We will recheck the vma after taking it again in write mode.
 	 */
 	mmap_read_unlock(mm);
-#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
+#ifdef CONFIG_HTMM
 	/* check whether there is enough free space in target memory node */
 	if (node_is_toptier(node)) {
 	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
@@ -1272,7 +1272,7 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 	spinlock_t *ptl;
 	int node = NUMA_NO_NODE, unmapped = 0;
 	bool writable = false;
-#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
+#ifdef CONFIG_HTMM
 	pginfo_t *pginfo;
 #endif
 

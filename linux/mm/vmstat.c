@@ -1361,7 +1361,7 @@ const char * const vmstat_text[] = {
 #ifdef CONFIG_BALLOON_COMPACTION
 	"balloon_migrate",
 #endif
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	"htmm_nr_promoted",
 	"htmm_nr_demoted",
 	"htmm_nr_sampled",

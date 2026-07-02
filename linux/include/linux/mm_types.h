@@ -178,7 +178,7 @@ struct page {
 		};
 #endif
 
-#ifdef CONFIG_HTMM_PAGR
+#ifdef CONFIG_PAGR
 		struct {	/* Third~ tail pages of compound page */
 			unsigned long __compound_pad_1; /* compound_head */
 			/* 32 bytes left */

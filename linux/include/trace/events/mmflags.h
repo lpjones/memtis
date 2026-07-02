@@ -93,7 +93,7 @@
 #define IF_HAVE_PG_SKIP_KASAN_POISON(flag,string)
 #endif
 
-#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
+#if defined(CONFIG_HTMM)
 #define IF_HAVE_PG_HTMM(flag,string) ,{1UL << flag, string}
 #define IF_HAVE_PG_NEEDSPLIT(flag,string) ,{1UL << flag, string}
 #else

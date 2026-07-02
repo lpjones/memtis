@@ -8,7 +8,7 @@
 #include <linux/huge_mm.h>
 #include <linux/mm_inline.h>
 #include <linux/pid.h>
-#include <linux/htmm.h>
+#include <linux/pagr.h>
 #include <linux/mempolicy.h>
 #include <linux/migrate.h>
 #include <linux/swap.h>
@@ -165,6 +165,7 @@ void htmm_mm_exit(struct mm_struct *mm)
  * See struct page declaration in linux/mm_types.h */
 void __prep_transhuge_page_for_htmm(struct mm_struct *mm, struct page *page)
 {
+#ifdef CONFIG_HTMM
     int i, idx, offset;
     struct mem_cgroup *memcg = mm ? get_mem_cgroup_from_mm(mm) : NULL;
     pginfo_t pginfo = { 0, 0, 0, false, };
@@ -196,6 +197,12 @@ void __prep_transhuge_page_for_htmm(struct mm_struct *mm, struct page *page)
 	page[3].cooling_clock = memcg->cooling_clock + 1;
     else
 	page[3].cooling_clock = memcg->cooling_clock;
+#elif defined(CONFIG_PAGR)
+    page[3].last_va = 0;
+    page[3].last_cyc = 0;
+    page[3].last_ip = 0;
+    /* No SetPageHtmm for CONFIG_PAGR */
+#endif
 
     ClearPageActive(page);
 }
@@ -220,8 +227,10 @@ void clear_transhuge_pginfo(struct page *page)
 void copy_transhuge_pginfo(struct page *page,
 			   struct page *newpage)
 {
+#ifdef CONFIG_HTMM
     int i, idx, offset;
     pginfo_t zero_pginfo = { 0 };
+#endif
 
     VM_BUG_ON_PAGE(!PageCompound(page), page);
     VM_BUG_ON_PAGE(!PageCompound(newpage), newpage);
@@ -229,9 +238,12 @@ void copy_transhuge_pginfo(struct page *page,
     page = compound_head(page);
     newpage = compound_head(newpage);
 
+#ifdef CONFIG_HTMM
     if (!PageHtmm(&page[3]))
 	return;
+#endif
 
+#ifdef CONFIG_HTMM
     newpage[3].hot_utils = page[3].hot_utils;
     newpage[3].total_accesses = page[3].total_accesses;
     newpage[3].skewness_idx = page[3].skewness_idx;
@@ -253,21 +265,52 @@ void copy_transhuge_pginfo(struct page *page,
 	page[idx].mapping = TAIL_MAPPING;
 	SetPageHtmm(&newpage[idx]);
     }
+#elif defined(CONFIG_PAGR)
+    newpage[3].last_va = page[3].last_va;
+    newpage[3].last_cyc = page[3].last_cyc;
+    newpage[3].last_ip = page[3].last_ip;
+    /* No SetPageHtmm for CONFIG_PAGR */
+#endif
 }
 
-pginfo_t *get_compound_pginfo(struct page *page, int neighbor_idx)
+pginfo_t *get_compound_pginfo(struct page *page, unsigned long address)
 {
-	int tail_page_idx;
-	VM_BUG_ON_PAGE(!PageCompound(page), page);
-	VM_BUG_ON_PAGE(idx < 0 || idx >= 16, page);
+#ifdef CONFIG_HTMM
+    int idx, offset;
+    
+    VM_BUG_ON_PAGE(!PageCompound(page), page);
 
-	tail_page_idx = 4 + neighbor_idx;
+    if (address) {
+	idx = (address & ~HPAGE_PMD_MASK) >> PAGE_SHIFT; // 0 ~ 511
+	offset = idx % 4;
+	idx = 4 + idx / 4;
+    }
+    else {
+	idx = 4;
+	offset = 0;
+    }
 
-	return &(page[tail_page_idx].pagr_info);
+    return &(page[idx].compound_pginfo[offset]);
+#elif defined(CONFIG_PAGR)
+    int neighbor_idx = 0; /* Or whatever logic applies to neighbor_idx */
+    int tail_page_idx;
+    VM_BUG_ON_PAGE(!PageCompound(page), page);
+
+    if (address) {
+	neighbor_idx = ((address & ~HPAGE_PMD_MASK) >> PAGE_SHIFT) / 32; /* assuming neighbor_idx was 0~15 */
+    }
+
+    tail_page_idx = 4 + neighbor_idx;
+
+    return &(page[tail_page_idx].pagr_info);
+#else
+    return NULL;
+#endif
 }
 
 void check_transhuge_cooling(void *arg, struct page *page, bool locked)
 {
+#ifdef CONFIG_HTMM
     struct mem_cgroup *memcg = arg ? (struct mem_cgroup *)arg : page_memcg(page);
     struct page *meta_page;
     pginfo_t *pginfo;
@@ -353,10 +396,12 @@ void check_transhuge_cooling(void *arg, struct page *page, bool locked)
 	meta_page->cooling_clock = memcg_cclock;
 
     spin_unlock(&memcg->access_lock);
+#endif
 }
 
 void check_base_cooling(pginfo_t *pginfo, struct page *page, bool locked)
 {
+#ifdef CONFIG_HTMM
     struct mem_cgroup *memcg = page_memcg(page);
     unsigned long prev_accessed, cur_idx;
     unsigned int memcg_cclock;
@@ -391,10 +436,12 @@ void check_base_cooling(pginfo_t *pginfo, struct page *page, bool locked)
     } else
 	pginfo->cooling_clock = memcg_cclock;
     spin_unlock(&memcg->access_lock);
+#endif
 }
 
 int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *mm)
 {
+#ifdef CONFIG_HTMM
     struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
     struct page *pte_page;
     pginfo_t *pginfo;
@@ -420,6 +467,7 @@ int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *mm)
     else
 	pginfo->cooling_clock = READ_ONCE(memcg->cooling_clock);
     pginfo->may_hot = false;
+#endif
 
     return 0;
 }
@@ -477,12 +525,16 @@ bool deferred_split_huge_page_for_htmm(struct page *page)
 void check_failed_list(struct mem_cgroup_per_node *pn,
 	struct list_head *tmp, struct list_head *failed_list)
 {
+#ifdef CONFIG_HTMM
     struct mem_cgroup *memcg = pn->memcg;
+#endif
 
     while (!list_empty(tmp)) {
 	struct page *page = lru_to_page(tmp);
+#ifdef CONFIG_HTMM
 	struct page *meta;
 	unsigned int idx;
+#endif
 
 	list_move(&page->lru, failed_list);
 	
@@ -495,12 +547,14 @@ void check_failed_list(struct mem_cgroup_per_node *pn,
 	    }
 	}
 
+#ifdef CONFIG_HTMM
 	meta = get_meta_page(page);
 	idx = meta->idx;
 
 	spin_lock(&memcg->access_lock);
 	memcg->hotness_hg[idx] += HPAGE_PMD_NR;
 	spin_unlock(&memcg->access_lock);
+#endif
     }
 }
 
@@ -705,6 +759,7 @@ int get_skew_idx(unsigned long num)
 /* linux/mm.h */
 void free_pginfo_pte(struct page *pte)
 {
+#ifdef CONFIG_HTMM
     if (!PageHtmm(pte))
 	return;
 
@@ -712,10 +767,12 @@ void free_pginfo_pte(struct page *pte)
     kmem_cache_free(pginfo_cache, pte->pginfo);
     pte->pginfo = NULL;
     ClearPageHtmm(pte);
+#endif
 }
 
 void uncharge_htmm_pte(pte_t *pte, struct mem_cgroup *memcg)
 {
+#ifdef CONFIG_HTMM
     struct page *pte_page;
     unsigned int idx;
     pginfo_t *pginfo;
@@ -738,19 +795,23 @@ void uncharge_htmm_pte(pte_t *pte, struct mem_cgroup *memcg)
     if (memcg->ebp_hotness_hg[idx] > 0)
 	memcg->ebp_hotness_hg[idx]--;
     spin_unlock(&memcg->access_lock);
+#endif
 }
 
 void uncharge_htmm_page(struct page *page, struct mem_cgroup *memcg)
 {
     unsigned int nr_pages = thp_nr_pages(page);
+#ifdef CONFIG_HTMM
     unsigned int idx;
     int i;
+#endif
 
     if (!memcg || !memcg->htmm_enabled)
 	return;
     
     page = compound_head(page);
     if (nr_pages != 1) { // hugepage
+#ifdef CONFIG_HTMM
 	struct page *meta = get_meta_page(page);
 
 	idx = meta->idx;
@@ -772,9 +833,11 @@ void uncharge_htmm_page(struct page *page, struct mem_cgroup *memcg)
 		memcg->ebp_hotness_hg[idx]--;
 	}
 	spin_unlock(&memcg->access_lock);
+#endif
     }
 }
 
+#ifdef CONFIG_HTMM
 static bool need_cooling(struct mem_cgroup *memcg)
 {
     struct mem_cgroup_per_node *pn;
@@ -808,6 +871,7 @@ static void set_lru_cooling(struct mm_struct *mm)
 	WRITE_ONCE(pn->need_cooling, true);
     }
 }
+#endif
 
 void set_lru_adjusting(struct mem_cgroup *memcg, bool inc_thres)
 {
@@ -829,6 +893,7 @@ void set_lru_adjusting(struct mem_cgroup *memcg, bool inc_thres)
 bool check_split_huge_page(struct mem_cgroup *memcg,
 	struct page *meta, bool hot)
 {
+#ifdef CONFIG_HTMM
     unsigned long split_thres = memcg->split_threshold;
     unsigned long split_thres_tail = split_thres - 1;
     bool tail_idx = false;
@@ -873,6 +938,9 @@ bool check_split_huge_page(struct mem_cgroup *memcg,
 	memcg->access_map[meta->skewness_idx]--;
     spin_unlock(&memcg->access_lock);
     return true;
+#else
+    return false;
+#endif
 }
 
 bool move_page_to_deferred_split_queue(struct mem_cgroup *memcg, struct page *page)
@@ -971,6 +1039,7 @@ lru_unlock:
 	BUG();
 }
 
+#ifdef CONFIG_HTMM
 static bool update_base_page(struct vm_area_struct *vma,
 	struct page *page, pginfo_t *pginfo, unsigned long address)
 {
@@ -1023,10 +1092,13 @@ static bool update_base_page(struct vm_area_struct *vma,
 
     return hot;
 }
+#endif
 
 static bool update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 	struct page *page, unsigned long address)
 {
+	printk_ratelimited("PAGR update_huge_page\n");
+#ifdef CONFIG_HTMM
     struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
     struct page *meta_page;
     pginfo_t *pginfo;
@@ -1102,11 +1174,16 @@ static bool update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 	move_page_to_inactive_lru(page);
 
     return hot;
+#else
+	printk_ratelimited("PAGR update_huge_page end\n");
+    return false;
+#endif
 }
 
 static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
 				unsigned long address, unsigned long cyc, unsigned long ip)
 {
+#ifdef CONFIG_HTMM
     pte_t *pte, ptent;
     spinlock_t *ptl;
     pginfo_t *pginfo;
@@ -1178,6 +1255,9 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
 pte_unlock:
     pte_unmap_unlock(pte, ptl);
     return ret;
+#else
+    return 0;
+#endif
 }
 
 static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
@@ -1186,38 +1266,56 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
     pmd_t *pmd, pmdval;
     bool ret = 0;
 
+	printk_ratelimited("PAGR __update_pmd_pginfo\n");
+
     pmd = pmd_offset(pud, address);
     if (!pmd || pmd_none(*pmd))
 	return ret;
+
+	printk_ratelimited("PAGR __update_pmd_pginfo 1\n");
     
     if (is_swap_pmd(*pmd))
 	return ret;
+
+	printk_ratelimited("PAGR __update_pmd_pginfo 2\n");
 
     if (!pmd_trans_huge(*pmd) && !pmd_devmap(*pmd) && unlikely(pmd_bad(*pmd))) {
 	pmd_clear_bad(pmd);
 	return ret;
     }
 
+	printk_ratelimited("PAGR __update_pmd_pginfo 3\n");
+
+
     pmdval = *pmd;
     if (pmd_trans_huge(pmdval) || pmd_devmap(pmdval)) {
-	struct page *page;
-	bool hot = false;
+		printk_ratelimited("PAGR __update_pmd_pginfo 4\n");
 
-	if (is_huge_zero_pmd(pmdval))
-	    return ret;
-	
-	page = pmd_page(pmdval);
-	if (!page)
-	    goto pmd_unlock;
-	
-	if (!PageCompound(page)) {
-	    goto pmd_unlock;
-	}
+		struct page *page;
+		bool hot = false;
 
-	{
+		if (is_huge_zero_pmd(pmdval))
+			return ret;
+
+		printk_ratelimited("PAGR __update_pmd_pginfo 5\n");
 		
-        // TODO: update values (ip, va, cyc) for huge page
-		printk_ratelimited("Previous: va: %lx, cyc: %lu, ip: %lx\n", 
+		
+		page = pmd_page(pmdval);
+		if (!page)
+			goto pmd_unlock;
+
+		printk_ratelimited("PAGR __update_pmd_pginfo 6\n");
+		
+		
+		if (!PageCompound(page)) {
+			goto pmd_unlock;
+		}
+
+		printk_ratelimited("PAGR __update_pmd_pginfo 7\n");
+
+			
+		// TODO: update values (ip, va, cyc) for huge page
+		printk_ratelimited("Previous: va: %llx, cyc: %llu, ip: %llx\n", 
 			page[3].last_va, page[3].last_cyc, page[3].last_ip);
 		page[3].last_va = address;
 		page[3].last_cyc = cyc;
@@ -1225,44 +1323,53 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 		printk_ratelimited("Now: va: %lx, cyc: %lu, ip: %lx\n", 
 			page[3].last_va, page[3].last_cyc, page[3].last_ip);
 		// TODO: Update neighbors in pginfo_t struct
-	}
 
-	hot = update_huge_page(vma, pmd, page, address);
-	if (hot) {
-		struct pebs_rec rec;
-		rec.cyc = rdtsc();
-		rec.va = address;
-		rec.ip = 0;
-		rec.cpu = 0;
-		rec.evt = 0;
-		if (memtis_pred_file) {
-			ssize_t written;
+		hot = update_huge_page(vma, pmd, page, address);
+		if (hot) {
+			printk_ratelimited("PAGR __update_pmd_pginfo 8\n");
 
-			written = kernel_write(memtis_pred_file,
-						&rec,
-						sizeof(rec),
-						&memtis_pred_pos);
-			if (written != sizeof(rec))
-				pr_warn_ratelimited("htmm: pred write failed (%zd)\n",
-							written);
+			struct pebs_rec rec;
+			rec.cyc = rdtsc();
+			rec.va = address;
+			rec.ip = 0;
+			rec.cpu = 0;
+			rec.evt = 0;
+			if (memtis_pred_file) {
+				ssize_t written;
+
+				written = kernel_write(memtis_pred_file,
+							&rec,
+							sizeof(rec),
+							&memtis_pred_pos);
+				if (written != sizeof(rec))
+					pr_warn_ratelimited("htmm: pred write failed (%zd)\n",
+								written);
+			}
 		}
-	}
 
-	if (htmm_cxl_mode) {
-	    if (page_to_nid(page) == 0)
-			return 1;
-	    else
-			return 2;
-	}
-	else {
-	    if (node_is_toptier(page_to_nid(page)))
-			return 1;
-	    else
-			return 2;
-	}
+		if (htmm_cxl_mode) {
+			printk_ratelimited("PAGR __update_pmd_pginfo 9\n");
+
+			if (page_to_nid(page) == 0) {
+				printk_ratelimited("PAGR __update_pmd_pginfo 10\n");
+				return 1;
+			} else {
+				printk_ratelimited("PAGR __update_pmd_pginfo 11\n");
+				return 2;
+			}
+		}
+		else {
+			if (node_is_toptier(page_to_nid(page)))
+				return 1;
+			else
+				return 2;
+		}
 pmd_unlock:
-	return 0;
+		printk_ratelimited("PAGR __update_pmd_pginfo 12\n");
+		return 0;
     }
+
+	printk_ratelimited("PAGR __update_pmd_pginfo end\n");
 
     /* base page */
     return __update_pte_pginfo(vma, pmd, address, cyc, ip);
@@ -1274,17 +1381,26 @@ static int __update_pginfo(struct vm_area_struct *vma, unsigned long address, un
     p4d_t *p4d;
     pud_t *pud;
 
+	printk_ratelimited("PAGR: __update_pginfo\n");
+
+
     pgd = pgd_offset(vma->vm_mm, address);
     if (pgd_none_or_clear_bad(pgd))
 	return 0;
+
+	printk_ratelimited("PAGR: __update_pginfo 1\n");
     
     p4d = p4d_offset(pgd, address);
     if (p4d_none_or_clear_bad(p4d))
 	return 0;
+
+	printk_ratelimited("PAGR: __update_pginfo 2\n");
     
     pud = pud_offset(p4d, address);
     if (pud_none_or_clear_bad(pud))
 	return 0;
+
+	printk_ratelimited("PAGR: __update_pginfo 3\n");
     
     return __update_pmd_pginfo(vma, pud, address, cyc, ip);
 }
@@ -1384,6 +1500,7 @@ static void reset_memcg_stat(struct mem_cgroup *memcg)
 static bool __cooling(struct mm_struct *mm,
 	struct mem_cgroup *memcg)
 {
+#ifdef CONFIG_HTMM
     int nid;
 
     /* check whether the previous cooling is done or not. */
@@ -1396,6 +1513,7 @@ static bool __cooling(struct mm_struct *mm,
 	    return false;
 	}
     }
+#endif
 
     spin_lock(&memcg->access_lock);
 
@@ -1405,7 +1523,9 @@ static bool __cooling(struct mm_struct *mm,
     memcg->cooled = true;
     smp_mb();
     spin_unlock(&memcg->access_lock);
+#ifdef CONFIG_HTMM
     set_lru_cooling(mm);
+#endif
     return true;
 }
 
@@ -1527,100 +1647,138 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned lon
     static unsigned long last_thres_adaptation;
     last_thres_adaptation= jiffies;
 
+	printk_ratelimited("PAGR: update_pginfo\n");
+
     if (htmm_mode == HTMM_NO_MIG)
 	goto put_task;
+
+	printk_ratelimited("PAGR: update_pginfo 1\n");
 
     if (!mm) {
 	goto put_task;
     }
 
+	printk_ratelimited("PAGR: update_pginfo 2\n");
+
     if (!mmap_read_trylock(mm))
 	goto put_task;
+
+	printk_ratelimited("PAGR: update_pginfo 3\n");
 
     vma = find_vma(mm, address);
     if (unlikely(!vma))
 	goto mmap_unlock;
+
+	printk_ratelimited("PAGR: update_pginfo 4\n");
+
     
     if (!vma->vm_mm || !vma_migratable(vma) ||
 	(vma->vm_file && (vma->vm_flags & (VM_READ | VM_WRITE)) == (VM_READ)))
 	goto mmap_unlock;
+
+	printk_ratelimited("PAGR: update_pginfo 5\n");
     
     memcg = get_mem_cgroup_from_mm(mm);
-    if (!memcg || !memcg->htmm_enabled)
-	goto mmap_unlock;
+	if (!memcg)
+		goto mmap_unlock;
+    // if (!memcg || !memcg->htmm_enabled)
+	// goto mmap_unlock;
+
+	printk_ratelimited("PAGR: update_pginfo 6\n");
     
     /* increase sample counts only for valid records */
     ret = __update_pginfo(vma, address, cyc, ip);
     if (ret == 1) { /* memory accesses to DRAM */
-	memcg->nr_sampled++;
-	memcg->nr_sampled_for_split++;
-	memcg->nr_dram_sampled++;
-	memcg->nr_max_sampled++;
-    }
-    else if (ret == 2) {
-	memcg->nr_sampled++;
-	memcg->nr_sampled_for_split++;
-	memcg->nr_max_sampled++;
-    } else
-	goto mmap_unlock;
-    
+		printk_ratelimited("PAGR: update_pginfo 7\n");
+		memcg->nr_sampled++;
+		memcg->nr_sampled_for_split++;
+		memcg->nr_dram_sampled++;
+		memcg->nr_max_sampled++;
+    } else if (ret == 2) {
+		printk_ratelimited("PAGR: update_pginfo 8\n");
+		memcg->nr_sampled++;
+		memcg->nr_sampled_for_split++;
+		memcg->nr_max_sampled++;
+    } else {
+		printk_ratelimited("PAGR: update_pginfo 9\n");
+		goto mmap_unlock;
+	}
+	printk_ratelimited("PAGR: update_pginfo 9.1\n");
     /* cooling and split decision */
     if (memcg->nr_sampled % htmm_cooling_period == 0 ||
 	    need_memcg_cooling(memcg)) {
-	/* cooling -- updates thresholds and sets need_cooling flags */
-	if (__cooling(mm, memcg)) {
-	    unsigned long temp_rhr = memcg->prev_dram_sampled;
-	    /* updates actual access stat */
-	    memcg->prev_dram_sampled >>= 1;
-	    memcg->prev_dram_sampled += memcg->nr_dram_sampled;
-	    memcg->nr_dram_sampled = 0;
-	    /* updates estimated access stat */
-	    memcg->prev_max_dram_sampled >>= 1;
-	    memcg->prev_max_dram_sampled += memcg->max_dram_sampled;
-	    memcg->max_dram_sampled = 0;
+		printk_ratelimited("PAGR: update_pginfo 10\n");
 
-	    /* split decision period */
-	    /* split should be performed after cooling due to skewness factor */
-	    if (!memcg->need_split && htmm_thres_split) {
-		unsigned long usage = page_counter_read(&memcg->memory);
-		/* htmm_split_period: 2 by default
-		 * This means that the number of sampled records should 
-		 * exceed a quarter of the WSS
-		 */
-		usage >>= htmm_split_period;
-		// the num. of samples must be larger than the fast tier size.
-		usage = max(usage, memcg->max_nr_dram_pages);
-	    
-		if (memcg->nr_sampled_for_split > usage) {
-		    /* if split is already performed in the previous
-		     * and rhr is not improved, stop split huge pages */
-		    if (memcg->split_happen) {
-			if (memcg->prev_dram_sampled < (temp_rhr * 103 / 100)) { // 3%
-			    htmm_thres_split = 0;
-			    goto mmap_unlock;
+	/* cooling -- updates thresholds and sets need_cooling flags */
+		if (__cooling(mm, memcg)) {
+			printk_ratelimited("PAGR: update_pginfo 11\n");
+
+			unsigned long temp_rhr = memcg->prev_dram_sampled;
+			/* updates actual access stat */
+			memcg->prev_dram_sampled >>= 1;
+			memcg->prev_dram_sampled += memcg->nr_dram_sampled;
+			memcg->nr_dram_sampled = 0;
+			/* updates estimated access stat */
+			memcg->prev_max_dram_sampled >>= 1;
+			memcg->prev_max_dram_sampled += memcg->max_dram_sampled;
+			memcg->max_dram_sampled = 0;
+
+			/* split decision period */
+			/* split should be performed after cooling due to skewness factor */
+			if (!memcg->need_split && htmm_thres_split) {
+				printk_ratelimited("PAGR: update_pginfo 12\n");
+
+				unsigned long usage = page_counter_read(&memcg->memory);
+				/* htmm_split_period: 2 by default
+				* This means that the number of sampled records should 
+				* exceed a quarter of the WSS
+				*/
+				usage >>= htmm_split_period;
+				// the num. of samples must be larger than the fast tier size.
+				usage = max(usage, memcg->max_nr_dram_pages);
+				
+				if (memcg->nr_sampled_for_split > usage) {
+					printk_ratelimited("PAGR: update_pginfo 13\n");
+
+					/* if split is already performed in the previous
+					* and rhr is not improved, stop split huge pages */
+					if (memcg->split_happen) {
+						printk_ratelimited("PAGR: update_pginfo 14\n");
+
+						if (memcg->prev_dram_sampled < (temp_rhr * 103 / 100)) { // 3%
+							printk_ratelimited("PAGR: update_pginfo 15\n");
+
+							htmm_thres_split = 0;
+							goto mmap_unlock;
+						}
+					}
+					memcg->split_happen = false;
+					memcg->need_split = true;
+				} else {
+					printk_ratelimited("PAGR: update_pginfo 16\n");
+
+					/* re-calculate split threshold due to cooling */
+					memcg->nr_split = memcg->nr_split + memcg->nr_split_tail_idx;
+					memcg->nr_split_tail_idx = 0;
+					set_memcg_split_thres(memcg);
+				}
+				printk_ratelimited("PAGR: update_pginfo 16.1\n");
 			}
-		    }
-		    memcg->split_happen = false;
-		    memcg->need_split = true;
-		} else {
-		    /* re-calculate split threshold due to cooling */
-		    memcg->nr_split = memcg->nr_split + memcg->nr_split_tail_idx;
-		    memcg->nr_split_tail_idx = 0;
-		    set_memcg_split_thres(memcg);
+			printk("total_accesses: %lu max_dram_hits: %lu cur_hits: %lu \n",
+				memcg->nr_max_sampled, memcg->prev_max_dram_sampled, memcg->prev_dram_sampled);
+			memcg->nr_max_sampled >>= 1;
 		}
-	    }
-	    printk("total_accesses: %lu max_dram_hits: %lu cur_hits: %lu \n",
-		    memcg->nr_max_sampled, memcg->prev_max_dram_sampled, memcg->prev_dram_sampled);
-	    memcg->nr_max_sampled >>= 1;
-	}
-    }
-    /* threshold adaptation */
-    else if (memcg->nr_sampled % htmm_adaptation_period == 0) {
-	__adjust_active_threshold(mm, memcg);
+		printk_ratelimited("PAGR: update_pginfo 16.2\n");
+    } else if (memcg->nr_sampled % htmm_adaptation_period == 0) { /* threshold adaptation */
+		printk_ratelimited("PAGR: update_pginfo 17\n");
+		
+		__adjust_active_threshold(mm, memcg);
     }
 
 mmap_unlock:
+	printk_ratelimited("PAGR: update_pginfo 18\n");
     mmap_read_unlock(mm);
 put_task:
+	printk_ratelimited("PAGR: update_pginfo 19\n");
     put_pid(pid_struct);
 }

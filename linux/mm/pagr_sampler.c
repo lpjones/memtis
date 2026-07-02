@@ -273,8 +273,8 @@ static void pebs_enable(void)
 	int enabled_count = 0;
 
     printk("pebs enable\n");
-    if (!mem_event)
-	return;
+	if (!mem_event)
+		return;
 
 	memtis_trace_file = filp_open("/tmp/memtis_pebs_trace.bin",
 				     O_WRONLY | O_CREAT | O_TRUNC,
@@ -344,6 +344,7 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 
 static int ksamplingd(void *data)
 {
+	printk("PAGR ksamplingd\n");
     unsigned long long nr_sampled = 0, nr_dram = 0, nr_nvm = 0, nr_write = 0;
     unsigned long long nr_throttled = 0, nr_lost = 0, nr_unknown = 0;
     unsigned long long nr_skip = 0;
@@ -477,6 +478,7 @@ static int ksamplingd(void *data)
 								    written);
 				}
 
+				printk_ratelimited("Updating page: va: %llx, cyc: %llu, ip: %llx\n", he.addr, rec.cyc, rec.ip);
 			    update_pginfo(he.pid, he.addr, event, rec.cyc, rec.ip);
 
 			    //count_vm_event(HTMM_NR_SAMPLED);
@@ -540,7 +542,7 @@ static int ksamplingd(void *data)
 
 	    /* to prevent frequent updates, allow for a slight variation of +/- 0.5% */
 	    if (cputime > (ksampled_soft_cpu_quota + 5) &&
-		    sample_period != HTMM_PCOUNT) {
+		    sample_period != PCOUNT) {
 		/* need to increase the sample period */
 		/* only increase by 1 */
 		unsigned long tmp1 = sample_period, tmp2 = sample_inst_period;

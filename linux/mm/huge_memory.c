@@ -2136,7 +2136,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 			atomic_inc(&page[i]._mapcount);
 		pte_unmap(pte);
 	}
-#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
+#ifdef CONFIG_HTMM
 	/* pginfo-s managed by the huge page should be copied into pte->pginfo*/
 	if (PageHtmm(&page[3])) {
 	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
@@ -2407,12 +2407,9 @@ static void __split_huge_page_tail(struct page *head, int tail,
 		struct lruvec *lruvec, struct list_head *list)
 {
 	struct page *page_tail = head + tail;
-#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
+#ifdef CONFIG_HTMM
 	bool htmm_tail = PageHtmm(page_tail) ? true : false;
 	bool htmm_active_tail = PageHtmm(head) && PageActive(page_tail);
-#else
-	bool htmm_tail = false;
-	bool htmm_active_tail = false;
 #endif
 	VM_BUG_ON_PAGE(atomic_read(&page_tail->_mapcount) != -1, page_tail);
 
@@ -2445,7 +2442,7 @@ static void __split_huge_page_tail(struct page *head, int tail,
 	//VM_BUG_ON_PAGE(tail > 2 && !PageHtmm(head) && !htmm_tail && page_tail->mapping != TAIL_MAPPING,
 //			page_tail);
 
-#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
+#ifdef CONFIG_HTMM
 	if (htmm_tail)
 	    clear_transhuge_pginfo(page_tail);
 	
@@ -2532,7 +2529,7 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 					head + i, 0);
 		}
 	}
-#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
+#ifdef CONFIG_HTMM
 	ClearPageHtmm(head);
 #endif
 	ClearPageCompound(head);
@@ -2834,7 +2831,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 				filemap_nr_thps_dec(mapping);
 			}
 		}
-#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
+#ifdef CONFIG_HTMM
 		{
 		    struct mem_cgroup *memcg = page_memcg(head);
 
