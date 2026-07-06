@@ -92,6 +92,7 @@ enum pagr_stat_idx {
 	PAGR_STAT_PRED_SKIP_ALREADY_PRED,
 	PAGR_STAT_PRED_SKIP_NOT_PROMOTABLE,
 	PAGR_STAT_PRED_SELECTED,
+	PAGR_STAT_PRED_CAP_HIT,
 	PAGR_STAT_PRED_ZERO,
 	PAGR_STAT_QUEUE_ATTEMPTS,
 	PAGR_STAT_QUEUE_NON_THP,
@@ -198,10 +199,11 @@ void pagr_debug_dump(const char *where)
 		pagr_stat_read(PAGR_STAT_NEIGHBOR_UPDATES),
 		pagr_stat_read(PAGR_STAT_NEIGHBOR_CANDIDATES));
 
-	pr_info("PAGR_DBG[%s] pred calls=%lld no_entry=%lld selected=%lld zero=%lld skip_empty=%lld skip_dist=%lld skip_stale=%lld skip_time=%lld skip_dup=%lld skip_already_pred=%lld skip_not_promotable=%lld\n",
+	pr_info("PAGR_DBG[%s] pred calls=%lld no_entry=%lld selected=%lld cap_hit=%lld zero=%lld skip_empty=%lld skip_dist=%lld skip_stale=%lld skip_time=%lld skip_dup=%lld skip_already_pred=%lld skip_not_promotable=%lld\n",
 		where, pagr_stat_read(PAGR_STAT_PRED_CALLS),
 		pagr_stat_read(PAGR_STAT_PRED_NO_ENTRY),
 		pagr_stat_read(PAGR_STAT_PRED_SELECTED),
+		pagr_stat_read(PAGR_STAT_PRED_CAP_HIT),
 		pagr_stat_read(PAGR_STAT_PRED_ZERO),
 		pagr_stat_read(PAGR_STAT_PRED_SKIP_EMPTY),
 		pagr_stat_read(PAGR_STAT_PRED_SKIP_DISTANCE),
@@ -726,6 +728,9 @@ int pagr_predict_pages(struct page *page, struct page **out_predictions)
 {
 	unsigned int selected[PAGR_MAX_PREDICTIONS];
 	unsigned long flags;
+	unsigned int max_predictions = min_t(unsigned int,
+					     PAGR_MAX_PREDICTIONS,
+					     PAGR_MAX_PREDICTIONS_PER_SAMPLE);
 	u64 threshold, mig_time, total_time_diff = 0;
 	int count = 0;
 	int cur_idx;
@@ -821,11 +826,13 @@ int pagr_predict_pages(struct page *page, struct page **out_predictions)
 			selected[count] = pred_idx;
 			out_predictions[count++] = pred_page;
 			pagr_stat_inc(PAGR_STAT_PRED_SELECTED);
-			if (count >= PAGR_MAX_PREDICTIONS)
+			if (count >= max_predictions) {
+				pagr_stat_inc(PAGR_STAT_PRED_CAP_HIT);
 				break;
+			}
 		}
 
-		if (!closest || count >= PAGR_MAX_PREDICTIONS)
+		if (!closest || count >= max_predictions)
 			break;
 
 		total_time_diff += closest->time_diff;
