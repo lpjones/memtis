@@ -115,7 +115,7 @@ void htmm_log_page_migration(struct page *page,
 	demotion_target = next_demotion_node(src_nid);
 
 	rec.cyc = rdtsc();
-	rec.va = va;
+	rec.va = PageTransHuge(page) ? va & HPAGE_PMD_MASK : va & PAGE_MASK;
 	rec.ip = 0;
 	rec.cpu = smp_processor_id();
 	rec.evt = 0;
@@ -1097,7 +1097,6 @@ static bool update_base_page(struct vm_area_struct *vma,
 static bool update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 	struct page *page, unsigned long address)
 {
-	printk_ratelimited("PAGR update_huge_page\n");
 #ifdef CONFIG_HTMM
     struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
     struct page *meta_page;
@@ -1175,8 +1174,46 @@ static bool update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 
     return hot;
 #else
-	printk_ratelimited("PAGR update_huge_page end\n");
-    return false;
+	struct page *predictions[PAGR_MAX_PREDICTIONS];
+	int nr_predictions, nr_queued = 0, i;
+
+	page = compound_head(page);
+	address &= HPAGE_PMD_MASK;
+	page[3].last_va = address;
+	pagr_add_page(page, address, page[3].last_cyc, page[3].last_ip);
+	nr_predictions = pagr_predict_pages(page, predictions);
+
+	for (i = 0; i < nr_predictions; i++) {
+		struct pebs_rec rec;
+		int pred_nid;
+		unsigned long pred_va = predictions[i][3].last_va;
+		unsigned long pred_ip = predictions[i][3].last_ip;
+
+		pred_nid = queue_pagr_prediction(predictions[i]);
+		if (pred_nid == NUMA_NO_NODE)
+			continue;
+		nr_queued++;
+		kmigraterd_wakeup(pred_nid);
+
+		rec.cyc = rdtsc();
+		rec.va = pred_va;
+		rec.ip = pred_ip;
+		rec.cpu = smp_processor_id();
+		rec.evt = 0;
+		if (memtis_pred_file) {
+			ssize_t written;
+
+			written = kernel_write(memtis_pred_file,
+					       &rec,
+					       sizeof(rec),
+					       &memtis_pred_pos);
+			if (written != sizeof(rec))
+				pr_warn_ratelimited("htmm: pred write failed (%zd)\n",
+						    written);
+		}
+	}
+
+	return nr_queued > 0;
 #endif
 }
 
@@ -1264,70 +1301,48 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 				unsigned long address, unsigned long cyc, unsigned long ip)
 {
     pmd_t *pmd, pmdval;
-    bool ret = 0;
-
-	printk_ratelimited("PAGR __update_pmd_pginfo\n");
+    int ret = 0;
 
     pmd = pmd_offset(pud, address);
     if (!pmd || pmd_none(*pmd))
 	return ret;
 
-	printk_ratelimited("PAGR __update_pmd_pginfo 1\n");
-    
     if (is_swap_pmd(*pmd))
 	return ret;
-
-	printk_ratelimited("PAGR __update_pmd_pginfo 2\n");
 
     if (!pmd_trans_huge(*pmd) && !pmd_devmap(*pmd) && unlikely(pmd_bad(*pmd))) {
 	pmd_clear_bad(pmd);
 	return ret;
     }
 
-	printk_ratelimited("PAGR __update_pmd_pginfo 3\n");
-
-
     pmdval = *pmd;
     if (pmd_trans_huge(pmdval) || pmd_devmap(pmdval)) {
-		printk_ratelimited("PAGR __update_pmd_pginfo 4\n");
-
 		struct page *page;
 		bool hot = false;
 
 		if (is_huge_zero_pmd(pmdval))
 			return ret;
 
-		printk_ratelimited("PAGR __update_pmd_pginfo 5\n");
-		
-		
 		page = pmd_page(pmdval);
 		if (!page)
 			goto pmd_unlock;
 
-		printk_ratelimited("PAGR __update_pmd_pginfo 6\n");
-		
-		
 		if (!PageCompound(page)) {
 			goto pmd_unlock;
 		}
 
-		printk_ratelimited("PAGR __update_pmd_pginfo 7\n");
-
-			
-		// TODO: update values (ip, va, cyc) for huge page
-		printk_ratelimited("Previous: va: %llx, cyc: %llu, ip: %llx\n", 
-			page[3].last_va, page[3].last_cyc, page[3].last_ip);
+		page = compound_head(page);
+#ifdef CONFIG_PAGR
+		page[3].last_va = address & HPAGE_PMD_MASK;
+#else
 		page[3].last_va = address;
+#endif
 		page[3].last_cyc = cyc;
 		page[3].last_ip = ip;
-		printk_ratelimited("Now: va: %lx, cyc: %lu, ip: %lx\n", 
-			page[3].last_va, page[3].last_cyc, page[3].last_ip);
-		// TODO: Update neighbors in pginfo_t struct
 
 		hot = update_huge_page(vma, pmd, page, address);
+#ifdef CONFIG_HTMM
 		if (hot) {
-			printk_ratelimited("PAGR __update_pmd_pginfo 8\n");
-
 			struct pebs_rec rec;
 			rec.cyc = rdtsc();
 			rec.va = address;
@@ -1346,15 +1361,12 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 								written);
 			}
 		}
+#endif
 
 		if (htmm_cxl_mode) {
-			printk_ratelimited("PAGR __update_pmd_pginfo 9\n");
-
 			if (page_to_nid(page) == 0) {
-				printk_ratelimited("PAGR __update_pmd_pginfo 10\n");
 				return 1;
 			} else {
-				printk_ratelimited("PAGR __update_pmd_pginfo 11\n");
 				return 2;
 			}
 		}
@@ -1365,11 +1377,8 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 				return 2;
 		}
 pmd_unlock:
-		printk_ratelimited("PAGR __update_pmd_pginfo 12\n");
 		return 0;
     }
-
-	printk_ratelimited("PAGR __update_pmd_pginfo end\n");
 
     /* base page */
     return __update_pte_pginfo(vma, pmd, address, cyc, ip);
@@ -1381,27 +1390,18 @@ static int __update_pginfo(struct vm_area_struct *vma, unsigned long address, un
     p4d_t *p4d;
     pud_t *pud;
 
-	printk_ratelimited("PAGR: __update_pginfo\n");
-
-
     pgd = pgd_offset(vma->vm_mm, address);
     if (pgd_none_or_clear_bad(pgd))
 	return 0;
 
-	printk_ratelimited("PAGR: __update_pginfo 1\n");
-    
     p4d = p4d_offset(pgd, address);
     if (p4d_none_or_clear_bad(p4d))
 	return 0;
 
-	printk_ratelimited("PAGR: __update_pginfo 2\n");
-    
     pud = pud_offset(p4d, address);
     if (pud_none_or_clear_bad(pud))
 	return 0;
 
-	printk_ratelimited("PAGR: __update_pginfo 3\n");
-    
     return __update_pmd_pginfo(vma, pud, address, cyc, ip);
 }
 
@@ -1674,7 +1674,7 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned lon
     
     if (!vma->vm_mm || !vma_migratable(vma) ||
 	(vma->vm_file && (vma->vm_flags & (VM_READ | VM_WRITE)) == (VM_READ)))
-	goto mmap_unlock;
+		goto mmap_unlock;
 
 	printk_ratelimited("PAGR: update_pginfo 5\n");
     

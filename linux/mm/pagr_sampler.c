@@ -15,6 +15,8 @@
 #include <linux/err.h>
 #include <linux/vmstat.h>
 #include <linux/printk.h>
+#include <linux/mutex.h>
+#include <linux/huge_mm.h>
 
 #include "../kernel/events/internal.h"
 
@@ -32,6 +34,7 @@ struct pebs_rec {
 } __attribute__((packed));
 
 struct task_struct *access_sampling = NULL;
+static DEFINE_MUTEX(access_sampling_lock);
 struct perf_event ***mem_event;
 static struct file ***mem_event_files;
 static int htmm_target_node;
@@ -162,8 +165,8 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
 
 	printk("pid: %d, cpu: %llu, event: %llu\n", __pid, cpu, config);
 	
-    event_fd = htmm__perf_event_open(&attr, __pid, cpu, -1, 0);
-    //event_fd = htmm__perf_event_open(&attr, -1, cpu, -1, 0);
+    // event_fd = htmm__perf_event_open(&attr, __pid, cpu, -1, 0);
+    event_fd = htmm__perf_event_open(&attr, -1, cpu, -1, 0);
     if (event_fd < 0) {
 	printk("[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
 	return -1;
@@ -262,6 +265,7 @@ static void pebs_disable(void)
 		memtis_trace_file = NULL;
 		memtis_trace_pos = 0;
 	}
+	pagr_debug_dump("pebs_disable");
 	htmm_pred_log_stop();
 	htmm_release_mem_events();
 }
@@ -382,7 +386,7 @@ static int ksamplingd(void *data)
     /* Currently uses a single CPU node(0) */
 	sample_mask = htmm_sample_cpumask();
 	if (!cpumask_empty(sample_mask))
-	do_set_cpus_allowed(access_sampling, sample_mask);
+	do_set_cpus_allowed(current, sample_mask);
 
     /* Initialize promotion/demotion counters */
     all_vm_events(vm_events);
@@ -462,7 +466,7 @@ static int ksamplingd(void *data)
 			    }
 
 			    rec.cyc = rdtsc();
-			    rec.va = he.addr;
+			    rec.va = he.addr & HPAGE_PMD_MASK;
 			    rec.ip = he.ip;
 			    rec.cpu = cpu;
 			    rec.evt = event;
@@ -620,25 +624,39 @@ int ksamplingd_init(pid_t pid, int node)
 {
     int ret;
 
-    if (access_sampling)
+    mutex_lock(&access_sampling_lock);
+
+    if (access_sampling) {
+	mutex_unlock(&access_sampling_lock);
 	return 0;
+    }
 
     ret = pebs_init(pid, node);
     if (ret) {
 	printk("htmm__perf_event_init failure... ERROR:%d\n", ret);
+	mutex_unlock(&access_sampling_lock);
 	return 0;
     }
 
 	pebs_enable();
 
-    return ksamplingd_run();
+    ret = ksamplingd_run();
+    mutex_unlock(&access_sampling_lock);
+
+    return ret;
 }
 
 void ksamplingd_exit(void)
 {
-    if (access_sampling) {
-	kthread_stop(access_sampling);
-	access_sampling = NULL;
-    }
+    struct task_struct *task;
+
+    mutex_lock(&access_sampling_lock);
+    task = access_sampling;
+    access_sampling = NULL;
+
+    if (task)
+	kthread_stop(task);
     pebs_disable();
+
+    mutex_unlock(&access_sampling_lock);
 }

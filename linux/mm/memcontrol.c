@@ -5133,7 +5133,7 @@ static int alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 	pn->usage_in_excess = 0;
 	pn->on_tree = false;
 	pn->memcg = memcg;
-#ifdef CONFIG_HTMM /* alloc_mem_cgroup_per_node_info() */
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR) /* alloc_mem_cgroup_per_node_info() */
 	pn->max_nr_base_pages = ULONG_MAX;
 	INIT_LIST_HEAD(&pn->kmigraterd_list);
 	pn->need_cooling = false;
@@ -5166,7 +5166,7 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	int node;
 
 	for_each_node(node) {
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 		del_memcg_from_kmigraterd(memcg, node);
 #endif
 		free_mem_cgroup_per_node_info(memcg, node);
@@ -5239,7 +5239,7 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 	INIT_LIST_HEAD(&memcg->deferred_split_queue.split_queue);
 	memcg->deferred_split_queue.split_queue_len = 0;
 #endif
-#ifdef CONFIG_HTMM /* mem_cgroup_alloc() */
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR) /* mem_cgroup_alloc() */
 	memcg->htmm_enabled = false;
 	memcg->max_nr_dram_pages = ULONG_MAX;
 	memcg->nr_active_pages = 0;
@@ -7576,7 +7576,7 @@ core_initcall(mem_cgroup_swap_init);
 
 #endif /* CONFIG_MEMCG_SWAP */
 
-#ifdef CONFIG_HTMM /* memcg interfaces for htmm */
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR) /* memcg interfaces for htmm/pagr */
 static int memcg_htmm_show(struct seq_file *m, void *v)
 {
     struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
@@ -7809,4 +7809,4 @@ int mem_cgroup_per_node_htmm_init(void)
     return 0;
 }
 subsys_initcall(mem_cgroup_per_node_htmm_init);
-#endif /* CONFIG_HTMM */
+#endif /* CONFIG_HTMM || CONFIG_PAGR */

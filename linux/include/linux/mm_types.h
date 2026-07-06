@@ -187,7 +187,7 @@ struct page {
 					unsigned long last_va;
 					unsigned long last_cyc;
 					unsigned long last_ip;
-					/* 8 bytes left */
+					unsigned long pagr_flags;
 				};
 				struct {	/* Fourth~ tail pages of compound page */
 					pginfo_t pagr_info;

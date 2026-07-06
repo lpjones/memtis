@@ -6,6 +6,17 @@
 #define CPUS_PER_SOCKET 16
 #define MAX_MIGRATION_RATE_IN_MBPS  2048 /* 2048MB per sec */
 
+#define PAGR_HISTORY_SIZE	16
+#define PAGR_ENTRY_TABLE_SIZE	1024
+#define PAGR_MAX_NEIGHBORS	8
+#define PAGR_PREDICTION_DEPTH	16
+#define PAGR_MAX_PREDICTIONS	(PAGR_MAX_NEIGHBORS * PAGR_PREDICTION_DEPTH)
+#define PAGR_QUEUE_SIZE		4096
+#define PAGR_MAX_MIGRATE_BATCH	64
+
+#define PAGR_PAGE_IN_HISTORY	0
+#define PAGR_PAGE_PREDICTED	1
+
 
 /* pebs events */
 #define DRAM_LLC_LOAD_MISS  0x1d3
@@ -135,6 +146,37 @@ extern void uncharge_htmm_pte(pte_t *pte, struct mem_cgroup *memcg);
 extern void uncharge_htmm_page(struct page *page, struct mem_cgroup *memcg);
 extern void charge_htmm_page(struct page *page, struct mem_cgroup *memcg);
 
+/* pagr_algo.c */
+extern void pagr_add_page(struct page *page, unsigned long va,
+			  unsigned long cyc, unsigned long ip);
+extern int pagr_predict_pages(struct page *page,
+			      struct page **out_predictions);
+extern int queue_pagr_prediction(struct page *page);
+extern unsigned long process_pagr_predictions(pg_data_t *pgdat);
+extern bool pagr_predictions_pending(void);
+extern unsigned long migrate_pagr_predicted_page(pg_data_t *pgdat,
+						 struct page *page);
+
+enum pagr_mig_dbg_event {
+	PAGR_MIG_DBG_ATTEMPT,
+	PAGR_MIG_DBG_ATTEMPT_ACTIVE,
+	PAGR_MIG_DBG_ATTEMPT_INACTIVE,
+	PAGR_MIG_DBG_ACTIVATED,
+	PAGR_MIG_DBG_NON_THP,
+	PAGR_MIG_DBG_STALE_NODE,
+	PAGR_MIG_DBG_NO_TARGET,
+	PAGR_MIG_DBG_THP_UNSUPPORTED,
+	PAGR_MIG_DBG_ISOLATE_FAIL,
+	PAGR_MIG_DBG_UNEVICTABLE_OR_WRITEBACK,
+	PAGR_MIG_DBG_SUCCESS,
+	PAGR_MIG_DBG_FAILED,
+};
+
+extern void pagr_debug_note_migration(enum pagr_mig_dbg_event event,
+				      unsigned long nr_pages);
+extern void pagr_debug_note_lru_migration(int promotion,
+					  unsigned long nr_pages);
+extern void pagr_debug_dump(const char *where);
 
 extern void set_lru_split_pid(pid_t pid);
 extern void adjust_active_threshold(pid_t pid);

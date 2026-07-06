@@ -354,6 +354,129 @@ static unsigned long migrate_page_list(struct list_head *migrate_list,
     } else {
 		count_vm_events(HTMM_NR_DEMOTED, nr_succeeded);
     }
+    pagr_debug_note_lru_migration(promotion, nr_succeeded);
+
+    return nr_succeeded;
+}
+
+unsigned long migrate_pagr_predicted_page(pg_data_t *pgdat, struct page *page)
+{
+    LIST_HEAD(migrate_list);
+    unsigned int nr_succeeded = 0;
+    int target_nid;
+    int nr_pages = 0;
+    int isolated_stat = 0;
+    int src_nid;
+    int migrate_rc = 0;
+    unsigned long pfn;
+    unsigned long va = 0;
+    bool accounted = false;
+    bool active_before = false;
+    bool active_after = false;
+    bool evictable = true;
+    bool writeback = false;
+
+    if (!pgdat || !page)
+	return 0;
+
+    page = compound_head(page);
+    pfn = page_to_pfn(page);
+
+    if (!PageTransHuge(page)) {
+	pagr_debug_note_migration(PAGR_MIG_DBG_NON_THP, 0);
+	printk_ratelimited("PAGR: predicted page migration skipped non-THP pfn=%lx\n",
+			   pfn);
+	return 0;
+    }
+
+    src_nid = page_to_nid(page);
+    va = page[3].last_va;
+    active_before = PageActive(page);
+    pagr_debug_note_migration(PAGR_MIG_DBG_ATTEMPT, 0);
+    pagr_debug_note_migration(active_before ?
+			      PAGR_MIG_DBG_ATTEMPT_ACTIVE :
+			      PAGR_MIG_DBG_ATTEMPT_INACTIVE, 0);
+
+    if (src_nid != pgdat->node_id) {
+	pagr_debug_note_migration(PAGR_MIG_DBG_STALE_NODE, 0);
+	printk_ratelimited("PAGR: predicted page migration skipped stale node pfn=%lx va=%lx page_nid=%d worker_nid=%d\n",
+			   pfn, va, src_nid, pgdat->node_id);
+	return 0;
+    }
+
+    target_nid = htmm_cxl_mode ? 0 : next_promotion_node(pgdat->node_id);
+    if (target_nid == NUMA_NO_NODE || target_nid == pgdat->node_id) {
+	pagr_debug_note_migration(PAGR_MIG_DBG_NO_TARGET, 0);
+	printk_ratelimited("PAGR: predicted page migration skipped no target pfn=%lx va=%lx from_nid=%d target_nid=%d\n",
+			   pfn, va, pgdat->node_id, target_nid);
+	return 0;
+    }
+
+    if (PageTransHuge(page) && !thp_migration_supported()) {
+	pagr_debug_note_migration(PAGR_MIG_DBG_THP_UNSUPPORTED, 0);
+	printk_ratelimited("PAGR: predicted page migration skipped THP migration unsupported pfn=%lx va=%lx\n",
+			   pfn, va);
+	return 0;
+    }
+
+    if (!active_before) {
+	move_page_to_active_lru(page);
+	active_after = PageActive(page);
+	if (active_after)
+	    pagr_debug_note_migration(PAGR_MIG_DBG_ACTIVATED, 0);
+    } else {
+	active_after = true;
+    }
+
+    if (isolate_lru_page(page)) {
+	pagr_debug_note_migration(PAGR_MIG_DBG_ISOLATE_FAIL, 0);
+	printk_ratelimited("PAGR: predicted page migration failed isolate pfn=%lx va=%lx from_nid=%d to_nid=%d active_before=%d active_after=%d\n",
+			   pfn, va, page_to_nid(page), target_nid,
+			   active_before, active_after);
+	return 0;
+    }
+
+    list_add(&page->lru, &migrate_list);
+
+    evictable = page_evictable(page);
+    writeback = PageWriteback(page);
+    if (unlikely(!evictable) || writeback) {
+	pagr_debug_note_migration(PAGR_MIG_DBG_UNEVICTABLE_OR_WRITEBACK, 0);
+	printk_ratelimited("PAGR: predicted page migration skipped busy pfn=%lx va=%lx evictable=%d writeback=%d active_before=%d active_after=%d\n",
+			   pfn, va, evictable, writeback, active_before,
+			   active_after);
+	goto putback;
+    }
+
+    nr_pages = thp_nr_pages(page);
+    isolated_stat = NR_ISOLATED_ANON + page_is_file_lru(page);
+    mod_node_page_state(pgdat, isolated_stat, nr_pages);
+    accounted = true;
+
+    migrate_rc = migrate_pages(&migrate_list, alloc_migrate_page, NULL,
+	    target_nid, MIGRATE_ASYNC, MR_NUMA_MISPLACED, &nr_succeeded);
+
+putback:
+    if (!list_empty(&migrate_list))
+	putback_movable_pages(&migrate_list);
+
+    if (accounted)
+	mod_node_page_state(pgdat, isolated_stat, -nr_pages);
+
+    count_vm_events(HTMM_NR_PROMOTED, nr_succeeded);
+
+    if (nr_succeeded) {
+	pagr_debug_note_migration(PAGR_MIG_DBG_SUCCESS, nr_succeeded);
+	printk_ratelimited("PAGR: migrated predicted page pfn=%lx va=%lx from_nid=%d to_nid=%d nr_pages=%u active_before=%d active_after=%d migrate_rc=%d\n",
+			   pfn, va, src_nid, target_nid, nr_succeeded,
+			   active_before, active_after, migrate_rc);
+    } else {
+	pagr_debug_note_migration(PAGR_MIG_DBG_FAILED, 0);
+	printk_ratelimited("PAGR: predicted page migration failed pfn=%lx va=%lx from_nid=%d to_nid=%d nr_pages=%d active_before=%d active_after=%d evictable=%d writeback=%d migrate_rc=%d\n",
+			   pfn, va, src_nid, target_nid, nr_pages,
+			   active_before, active_after, evictable, writeback,
+			   migrate_rc);
+    }
 
     return nr_succeeded;
 }
@@ -631,13 +754,20 @@ static unsigned long demote_node(pg_data_t *pgdat, struct mem_cgroup *memcg,
 		get_memcg_demotion_watermark(max) < max)
 	    WRITE_ONCE(memcg->nodeinfo[pgdat->node_id]->need_demotion, false);
     } while (0);
+
+    if (nr_reclaimed || nr_exceeded)
+	pr_info_ratelimited("PAGR_LRU_DEMOTE node=%d requested=%lu reclaimed=%lu evictable=%lu shrink_active=%d\n",
+			    pgdat->node_id, nr_exceeded, nr_reclaimed,
+			    nr_evictable_pages, shrink_active);
+
     return nr_reclaimed;
 }
 
 static unsigned long promote_node(pg_data_t *pgdat, struct mem_cgroup *memcg)
 {
     struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
-    unsigned long nr_to_promote, nr_promoted = 0, tmp;
+    unsigned long nr_to_promote, nr_promoted = 0;
+    unsigned long requested;
     enum lru_list lru = LRU_ACTIVE_ANON;
     short priority = DEF_PRIORITY;
     int target_nid = htmm_cxl_mode ? 0 : next_promotion_node(pgdat->node_id);
@@ -650,14 +780,22 @@ static unsigned long promote_node(pg_data_t *pgdat, struct mem_cgroup *memcg)
     
     if (nr_to_promote == 0 && htmm_mode == HTMM_NO_MIG) {
 	lru = LRU_INACTIVE_ANON;
-	nr_to_promote = min(tmp, lruvec_lru_size(lruvec, lru, MAX_NR_ZONES));
+	nr_to_promote = lruvec_lru_size(lruvec, lru, MAX_NR_ZONES);
     }
+
+    requested = nr_to_promote;
     do {
 	nr_promoted += promote_lruvec(nr_to_promote, priority, pgdat, lruvec, lru);
 	if (nr_promoted >= nr_to_promote)
 	    break;
 	priority--;
     } while (priority);
+
+    if (nr_promoted || requested)
+	pr_info_ratelimited("PAGR_LRU_PROMOTE node=%d target=%d requested=%lu promoted=%lu lru=%d active_anon=%lu\n",
+			    pgdat->node_id, target_nid, requested, nr_promoted,
+			    lru, lruvec_lru_size(lruvec, LRU_ACTIVE_ANON,
+						 MAX_NR_ZONES));
     
     return nr_promoted;
 }
@@ -1050,9 +1188,13 @@ static int kmigraterd_promotion(pg_data_t *pgdat)
 	if (kthread_should_stop())
 	    break;
 
+	process_pagr_predictions(pgdat);
+
 	pn = next_memcg_cand(pgdat);
 	if (!pn) {
-	    msleep_interruptible(1000);
+	    wait_event_interruptible_timeout(pgdat->kmigraterd_wait,
+		    kthread_should_stop() || pagr_predictions_pending(),
+		    msecs_to_jiffies(htmm_promotion_period_in_ms));
 	    continue;
 	}
 
@@ -1083,12 +1225,16 @@ static int kmigraterd_promotion(pg_data_t *pgdat)
 		adjusting_node(pgdat, memcg, false);
 	}
 
+	process_pagr_predictions(pgdat);
+
 	/* promotes hot pages to fast memory node */
 	if (need_lowertier_promotion(pgdat, memcg)) {
 	    promote_node(pgdat, memcg);
 	}
 
-	msleep_interruptible(htmm_promotion_period_in_ms);
+	wait_event_interruptible_timeout(pgdat->kmigraterd_wait,
+		kthread_should_stop() || pagr_predictions_pending(),
+		msecs_to_jiffies(htmm_promotion_period_in_ms));
     }
 
     return 0;
@@ -1115,6 +1261,10 @@ static int kmigraterd(void *p)
 void kmigraterd_wakeup(int nid)
 {
     pg_data_t *pgdat = NODE_DATA(nid);
+
+    if (!pgdat || !pgdat->kmigraterd)
+	return;
+
     wake_up_interruptible(&pgdat->kmigraterd_wait);  
 }
 
