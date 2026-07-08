@@ -21,6 +21,14 @@
 #include "macros.h"
 #include "small_vector.h"
 
+// forward declarations of the pretty printers defined at the bottom of this
+// file; gcc >= 11 needs them visible at template-definition time so that
+// templates inside namespace util (e.g. format_list) can stream these types
+template <typename A, typename B>
+inline std::ostream &operator<<(std::ostream &o, const std::pair<A, B> &p);
+template <typename T, typename Alloc>
+static std::ostream &operator<<(std::ostream &o, const std::vector<T, Alloc> &v);
+
 namespace util {
 
 // padded, aligned primitives

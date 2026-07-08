@@ -205,6 +205,15 @@ extern bool htmm_cxl_mode;
 extern bool htmm_skip_cooling;
 extern unsigned int htmm_thres_cooling_alloc;
 extern unsigned int ksampled_soft_cpu_quota;
+extern unsigned int pagr_fast_threshold_min_percent;
+extern unsigned int pagr_fast_threshold_power;
+extern unsigned int pagr_fast_threshold_min_samples;
+extern unsigned int pagr_max_predictions_per_sample;
+extern unsigned int pagr_trace_enabled;
+extern unsigned int pagr_graph_enabled;
+extern unsigned int pagr_graph_sample_interval;
+extern unsigned int pagr_debug_interval_ms;
+extern unsigned int pagr_verbose;
 #endif
 static inline bool mpol_is_preferred_many(struct mempolicy *pol)
 {

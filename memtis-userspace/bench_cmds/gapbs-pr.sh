@@ -1,14 +1,15 @@
 #!/bin/bash
 
-######## changes the below path
-BIN=/path/to/benchmark
-GRAPH_DIR=/path/to/benchmark/benchmark/graphs
+BIN=/proj/TppPlus/tpp/workloads/gapbs
+# fixed copy: original twitter-2010.sg has a corrupted inverse-CSR section
+# (negative neighbor ids -> pr segfault); rebuilt from the valid out-CSR
+GRAPH_DIR=/mnt/pact_storage/workloads/gapbs
 
-BENCH_RUN="${BIN}/pr -f ${GRAPH_DIR}/twitter.sg -i1000 -t1e-4 -n20"
-BENCH_DRAM=""
+BENCH_RUN="${BIN}/pr -f ${GRAPH_DIR}/twitter-2010-fixed.sg -i1000 -t1e-4 -n20"
+BENCH_DRAM="max"
+BENCH_DRAM_BUFFER_MB="1024"
 
-
-# twitter.sg: ~12600MB 
+# twitter-2010.sg: ~12600MB
 
 if [[ "x${NVM_RATIO}" == "x1:32" ]]; then
     BENCH_DRAM="382MB"
@@ -26,6 +27,6 @@ elif [[ "x${NVM_RATIO}" == "x1:0" ]]; then
     BENCH_DRAM="70000MB"
 fi
 
-
 export BENCH_RUN
 export BENCH_DRAM
+export BENCH_DRAM_BUFFER_MB

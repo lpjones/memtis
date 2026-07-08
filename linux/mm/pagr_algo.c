@@ -10,6 +10,7 @@
 #include <linux/node.h>
 #include <linux/pagr.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <asm/msr.h>
 
 #include "internal.h"
@@ -65,11 +66,87 @@ static u64 pagr_avg_dist = 1 * PAGR_SCALE;
 static u64 pagr_bot_dist = 1 * PAGR_SCALE;
 static u64 pagr_mig_queue_time;
 static u64 pagr_mig_move_time;
+static unsigned long pagr_graph_updates;
 
 static struct pagr_queue_entry pagr_prediction_queue[PAGR_QUEUE_SIZE];
 static unsigned int pagr_queue_head;
 static unsigned int pagr_queue_tail;
 static DEFINE_SPINLOCK(pagr_queue_lock);
+
+/*
+ * Per-second fast (local DRAM) vs slow (NVM/CXL) access sample counts,
+ * updated by ksamplingd and reset every ~1s (mirrors pact's pebs_stats).
+ * Used to scale the promotion threshold: when most samples already hit
+ * the fast tier, decay pagr_bot_dist so PAGR promotes less aggressively.
+ */
+static atomic64_t pagr_fast_samples;
+static atomic64_t pagr_slow_samples;
+
+void pagr_note_access(bool fast)
+{
+	if (fast)
+		atomic64_inc(&pagr_fast_samples);
+	else
+		atomic64_inc(&pagr_slow_samples);
+}
+
+void pagr_read_access_counters(u64 *fast, u64 *slow)
+{
+	if (fast)
+		*fast = atomic64_read(&pagr_fast_samples);
+	if (slow)
+		*slow = atomic64_read(&pagr_slow_samples);
+}
+
+void pagr_reset_access_counters(void)
+{
+	atomic64_set(&pagr_fast_samples, 0);
+	atomic64_set(&pagr_slow_samples, 0);
+}
+
+static u64 pagr_pow_scaled(u64 value, unsigned int power)
+{
+	u64 result = value;
+	unsigned int i;
+
+	if (power <= 1)
+		return value;
+
+	power = min_t(unsigned int, power, 4);
+	for (i = 1; i < power; i++)
+		result = mul_u64_u64_div_u64(result, value, PAGR_SCALE);
+
+	return min_t(u64, result, PAGR_SCALE);
+}
+
+/*
+ * (1 - percent_fast^N), scaled by PAGR_SCALE.  Higher fast-tier hit rates
+ * lower the prediction threshold so PAGR stops promoting aggressively once
+ * the fast tier is already serving most sampled accesses.
+ */
+static u64 pagr_percent_fast_factor(void)
+{
+	u64 fast = atomic64_read(&pagr_fast_samples);
+	u64 slow = atomic64_read(&pagr_slow_samples);
+	u64 samples = fast + slow;
+	u64 min_factor;
+	u64 pf, pf_pow;
+	unsigned int min_percent;
+
+	if (samples < READ_ONCE(pagr_fast_threshold_min_samples))
+		return PAGR_SCALE;
+
+	min_percent = min_t(unsigned int,
+			    READ_ONCE(pagr_fast_threshold_min_percent), 100);
+	min_factor = div_u64((u64)min_percent * PAGR_SCALE, 100);
+
+	pf = div64_u64(fast * PAGR_SCALE, samples);
+	pf_pow = pagr_pow_scaled(pf, READ_ONCE(pagr_fast_threshold_power));
+	if (pf_pow > PAGR_SCALE)
+		pf_pow = PAGR_SCALE;
+
+	return max_t(u64, PAGR_SCALE - pf_pow, min_factor);
+}
 
 enum pagr_stat_idx {
 	PAGR_STAT_ADD_CALLS,
@@ -178,14 +255,17 @@ void pagr_debug_dump(const char *where)
 		spin_unlock_irqrestore(&pagr_lock, flags);
 	}
 
-	pr_info("PAGR_DBG[%s] state entries=%u predicted_entries=%u entry_snapshot=%u history=%u queue=%u threshold=%llu avg_dist=%llu va_top=%llu va_bot=%llu cyc_top=%llu cyc_bot=%llu ip_top=%llu ip_bot=%llu mig_queue=%llu mig_move=%llu\n",
+	pr_info("PAGR_DBG[%s] state entries=%u predicted_entries=%u entry_snapshot=%u history=%u queue=%u threshold=%llu avg_dist=%llu fast_factor=%llu va_top=%llu va_bot=%llu cyc_top=%llu cyc_bot=%llu ip_top=%llu ip_bot=%llu mig_queue=%llu mig_move=%llu max_pred=%u graph_interval=%u\n",
 		where, active_entries, predicted_entries,
 		have_entry_snapshot ? 1U : 0U, history_count, queue_count,
 		READ_ONCE(pagr_bot_dist),
-		READ_ONCE(pagr_avg_dist), READ_ONCE(top_va), READ_ONCE(bot_va),
+		READ_ONCE(pagr_avg_dist), pagr_percent_fast_factor(),
+		READ_ONCE(top_va), READ_ONCE(bot_va),
 		READ_ONCE(top_cyc), READ_ONCE(bot_cyc), READ_ONCE(top_ip),
 		READ_ONCE(bot_ip), READ_ONCE(pagr_mig_queue_time),
-		READ_ONCE(pagr_mig_move_time));
+		READ_ONCE(pagr_mig_move_time),
+		READ_ONCE(pagr_max_predictions_per_sample),
+		READ_ONCE(pagr_graph_sample_interval));
 
 	pr_info("PAGR_DBG[%s] add add=%lld non_thp=%lld alloc_fail=%lld new=%lld existing=%lld evicted=%lld hist=%lld hist_wrap=%lld neighbor_updates=%lld neighbor_candidates=%lld\n",
 		where, pagr_stat_read(PAGR_STAT_ADD_CALLS),
@@ -251,6 +331,10 @@ static void pagr_debug_maybe_dump(const char *where)
 {
 	unsigned long flags;
 	unsigned long now = jiffies;
+	unsigned int interval_ms = READ_ONCE(pagr_debug_interval_ms);
+
+	if (!interval_ms)
+		return;
 
 	if (time_before(now, READ_ONCE(pagr_next_debug_jiffies)))
 		return;
@@ -259,7 +343,8 @@ static void pagr_debug_maybe_dump(const char *where)
 		return;
 
 	if (time_after_eq(now, READ_ONCE(pagr_next_debug_jiffies))) {
-		WRITE_ONCE(pagr_next_debug_jiffies, now + HZ);
+		WRITE_ONCE(pagr_next_debug_jiffies,
+			   now + msecs_to_jiffies(interval_ms));
 		pagr_debug_dump(where);
 	}
 
@@ -452,7 +537,7 @@ static u64 normalize_diff(u64 diff, u64 *top, u64 *bot)
 
 static u64 calc_distance(struct pagr_entry *a, struct pagr_entry *b)
 {
-	u64 va_diff, cyc_diff, ip_diff, distance, dist_clip;
+	u64 va_diff, cyc_diff, ip_diff, distance, dist_clip, dist_scaled;
 
 	va_diff = normalize_diff(PAGR_ABS_DIFF(a->va, b->va),
 				 &top_va, &bot_va);
@@ -463,7 +548,17 @@ static u64 calc_distance(struct pagr_entry *a, struct pagr_entry *b)
 
 	distance = va_diff + cyc_diff + ip_diff;
 	dist_clip = PAGR_CLIP(distance, pagr_bot_dist / 10, pagr_avg_dist * 10);
-	pagr_bot_dist = update_bot(pagr_bot_dist, dist_clip);
+	/*
+	 * Scale the threshold input by (1 - percent_fast^2), as in pact's
+	 * algorithm.c: when nearly all sampled accesses already hit the fast
+	 * tier, the threshold decays towards its lower clip so PAGR stops
+	 * promoting aggressively; when slow-tier accesses dominate, the
+	 * factor approaches 1 and the original behavior is preserved.
+	 */
+	dist_scaled = mul_u64_u64_div_u64(dist_clip,
+					  pagr_percent_fast_factor(),
+					  PAGR_SCALE);
+	pagr_bot_dist = update_bot(pagr_bot_dist, dist_scaled);
 	pagr_avg_dist = (PAGR_DEC_DIST_NUM * dist_clip +
 			 (PAGR_SCALE - PAGR_DEC_DIST_NUM) * pagr_avg_dist) /
 			PAGR_SCALE;
@@ -547,7 +642,49 @@ static bool pagr_prediction_target(struct page *page, int *src_nid,
 	return true;
 }
 
-static void update_neighbors(unsigned int old_idx)
+static void add_pagr_graph_record(struct pagr_graph_record *records,
+				  unsigned int *nr_records,
+				  unsigned int max_records,
+				  struct pagr_entry *old_entry,
+				  struct pagr_entry *cur_entry,
+				  unsigned int old_idx,
+				  unsigned int cur_idx,
+				  unsigned int slot,
+				  unsigned int replaced_idx,
+				  u8 event,
+				  u64 distance,
+				  u64 time_diff)
+{
+	struct pagr_graph_record *record;
+
+	if (!records || !nr_records || *nr_records >= max_records)
+		return;
+
+	record = &records[(*nr_records)++];
+	memset(record, 0, sizeof(*record));
+	record->src_va = old_entry->va;
+	record->dst_va = cur_entry->va;
+	record->src_pfn = page_to_pfn(old_entry->page);
+	record->dst_pfn = page_to_pfn(cur_entry->page);
+	record->src_cyc = old_entry->cyc;
+	record->dst_cyc = cur_entry->cyc;
+	record->src_ip = old_entry->ip;
+	record->dst_ip = cur_entry->ip;
+	record->distance = distance;
+	record->time_diff = time_diff;
+	record->threshold = READ_ONCE(pagr_bot_dist);
+	record->avg_dist = READ_ONCE(pagr_avg_dist);
+	record->src_idx = old_idx;
+	record->dst_idx = cur_idx;
+	record->slot = slot;
+	record->replaced_idx = replaced_idx;
+	record->event = event;
+}
+
+static void update_neighbors(unsigned int old_idx,
+			     struct pagr_graph_record *graph_records,
+			     unsigned int *nr_graph_records,
+			     unsigned int max_graph_records)
 {
 	struct pagr_entry *old_entry = &pagr_entries[old_idx];
 	int i, j;
@@ -602,10 +739,28 @@ static void update_neighbors(unsigned int old_idx)
 		if (candidate >= 0) {
 			struct pagr_neighbor *neighbor =
 				&old_entry->neighbors[candidate];
+			unsigned int replaced_idx = neighbor->idx;
+			u8 event;
 
 			if (neighbor->idx == PAGR_INVALID_ENTRY ||
 			    neighbor->idx == cur_idx ||
 			    distance < neighbor->distance) {
+				if (neighbor->idx == PAGR_INVALID_ENTRY)
+					event = PAGR_GRAPH_EDGE_INSERT;
+				else if (neighbor->idx == cur_idx)
+					event = PAGR_GRAPH_EDGE_REFRESH;
+				else
+					event = PAGR_GRAPH_EDGE_REPLACE;
+
+				add_pagr_graph_record(graph_records,
+						      nr_graph_records,
+						      max_graph_records,
+						      old_entry, cur_entry,
+						      old_idx, cur_idx,
+						      candidate, replaced_idx,
+						      event, distance,
+						      cur_entry->cyc -
+						      old_entry->cyc);
 				neighbor->idx = cur_idx;
 				neighbor->distance = distance;
 				neighbor->time_diff = cur_entry->cyc - old_entry->cyc;
@@ -614,7 +769,10 @@ static void update_neighbors(unsigned int old_idx)
 	}
 }
 
-static void record_history_sample(unsigned int idx)
+static void record_history_sample(unsigned int idx,
+				  struct pagr_graph_record *graph_records,
+				  unsigned int *nr_graph_records,
+				  unsigned int max_graph_records)
 {
 	u64 min_cyc = U64_MAX;
 	int old_slot = -1;
@@ -645,7 +803,8 @@ static void record_history_sample(unsigned int idx)
 		return;
 
 	if (pagr_history[old_slot] < PAGR_ENTRY_TABLE_SIZE)
-		update_neighbors(pagr_history[old_slot]);
+		update_neighbors(pagr_history[old_slot], graph_records,
+				 nr_graph_records, max_graph_records);
 	pagr_history[old_slot] = idx;
 	pagr_stat_inc(PAGR_STAT_HISTORY_RECORDED);
 	pagr_stat_inc(PAGR_STAT_HISTORY_WRAPPED);
@@ -654,9 +813,13 @@ static void record_history_sample(unsigned int idx)
 void pagr_add_page(struct page *page, unsigned long va, unsigned long cyc,
 		   unsigned long ip)
 {
+	struct pagr_graph_record graph_records[PAGR_HISTORY_SIZE];
+	unsigned int nr_graph_records = 0;
+	unsigned int graph_interval;
 	struct pagr_entry *entry;
 	unsigned long flags;
 	bool predicted;
+	bool log_graph = false;
 	int idx;
 
 	pagr_stat_inc(PAGR_STAT_ADD_CALLS);
@@ -696,7 +859,13 @@ void pagr_add_page(struct page *page, unsigned long va, unsigned long cyc,
 	entry->cyc = cyc;
 	entry->ip = ip;
 	predicted = entry->predicted;
-	record_history_sample(idx);
+	if (READ_ONCE(pagr_graph_enabled)) {
+		graph_interval = max_t(unsigned int,
+				       READ_ONCE(pagr_graph_sample_interval), 1);
+		log_graph = (++pagr_graph_updates % graph_interval) == 0;
+	}
+	record_history_sample(idx, log_graph ? graph_records : NULL,
+			      &nr_graph_records, ARRAY_SIZE(graph_records));
 
 	page[3].last_va = va;
 	page[3].last_cyc = cyc;
@@ -708,6 +877,7 @@ void pagr_add_page(struct page *page, unsigned long va, unsigned long cyc,
 		__clear_bit(PAGR_PAGE_PREDICTED, &page[3].pagr_flags);
 
 	spin_unlock_irqrestore(&pagr_lock, flags);
+	htmm_log_pagr_graph_records(graph_records, nr_graph_records);
 	pagr_debug_maybe_dump("add_page");
 }
 
@@ -728,9 +898,11 @@ int pagr_predict_pages(struct page *page, struct page **out_predictions)
 {
 	unsigned int selected[PAGR_MAX_PREDICTIONS];
 	unsigned long flags;
-	unsigned int max_predictions = min_t(unsigned int,
-					     PAGR_MAX_PREDICTIONS,
-					     PAGR_MAX_PREDICTIONS_PER_SAMPLE);
+	unsigned int max_predictions = min3(PAGR_MAX_PREDICTIONS,
+					    PAGR_MAX_PREDICTIONS_PER_SAMPLE,
+					    max_t(unsigned int,
+						  READ_ONCE(pagr_max_predictions_per_sample),
+						  1));
 	u64 threshold, mig_time, total_time_diff = 0;
 	int count = 0;
 	int cur_idx;

@@ -15,8 +15,22 @@
 #define PAGR_QUEUE_SIZE		4096
 #define PAGR_MAX_MIGRATE_BATCH	64
 
+#define PAGR_GRAPH_MAGIC	0x3146524752474150ULL /* "PAGRGRF1" */
+#define PAGR_GRAPH_VERSION	1
+#define PAGR_GRAPH_INVALID_IDX	(~0U)
+
 #define PAGR_PAGE_IN_HISTORY	0
 #define PAGR_PAGE_PREDICTED	1
+
+extern unsigned int pagr_fast_threshold_min_percent;
+extern unsigned int pagr_fast_threshold_power;
+extern unsigned int pagr_fast_threshold_min_samples;
+extern unsigned int pagr_max_predictions_per_sample;
+extern unsigned int pagr_trace_enabled;
+extern unsigned int pagr_graph_enabled;
+extern unsigned int pagr_graph_sample_interval;
+extern unsigned int pagr_debug_interval_ms;
+extern unsigned int pagr_verbose;
 
 
 /* pebs events */
@@ -127,6 +141,43 @@ extern void update_pginfo(pid_t pid, unsigned long address, enum events e, unsig
 extern int htmm_pred_log_start(void);
 extern void htmm_pred_log_stop(void);
 
+struct pagr_graph_header {
+	__u64 magic;
+	__u32 version;
+	__u32 record_size;
+} __attribute__((packed));
+
+struct pagr_graph_record {
+	__u64 log_cyc;
+	__u64 src_va;
+	__u64 dst_va;
+	__u64 src_pfn;
+	__u64 dst_pfn;
+	__u64 src_cyc;
+	__u64 dst_cyc;
+	__u64 src_ip;
+	__u64 dst_ip;
+	__u64 distance;
+	__u64 time_diff;
+	__u64 threshold;
+	__u64 avg_dist;
+	__u32 src_idx;
+	__u32 dst_idx;
+	__u32 slot;
+	__u32 replaced_idx;
+	__u8 event;
+	__u8 reserved[7];
+} __attribute__((packed));
+
+enum pagr_graph_event {
+	PAGR_GRAPH_EDGE_INSERT = 1,
+	PAGR_GRAPH_EDGE_REFRESH = 2,
+	PAGR_GRAPH_EDGE_REPLACE = 3,
+};
+
+extern void htmm_log_pagr_graph_records(struct pagr_graph_record *records,
+					unsigned int nr_records);
+
 extern bool deferred_split_huge_page_for_htmm(struct page *page);
 extern unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
 						  struct list_head *split_list);
@@ -157,6 +208,9 @@ extern unsigned long process_pagr_predictions(pg_data_t *pgdat);
 extern bool pagr_predictions_pending(void);
 extern unsigned long migrate_pagr_predicted_page(pg_data_t *pgdat,
 						 struct page *page);
+extern void pagr_note_access(bool fast);
+extern void pagr_read_access_counters(u64 *fast, u64 *slow);
+extern void pagr_reset_access_counters(void);
 
 enum pagr_mig_dbg_event {
 	PAGR_MIG_DBG_ATTEMPT,

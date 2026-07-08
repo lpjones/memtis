@@ -29,6 +29,18 @@ function func_cache_flush() {
     return
 }
 
+function set_htmm_knob() {
+    local name="$1"
+    local value="$2"
+    local path="/sys/kernel/mm/htmm/${name}"
+
+    if [[ -w "${path}" ]]; then
+	echo "${value}" | tee "${path}"
+    else
+	echo "WARNING: ${path} is not writable or does not exist; wanted ${value}"
+    fi
+}
+
 function func_memtis_setting() {
     echo 199 | tee /sys/kernel/mm/htmm/htmm_sample_period
     echo 100007 | tee /sys/kernel/mm/htmm/htmm_inst_sample_period
@@ -65,6 +77,18 @@ function func_memtis_setting() {
 
     echo "always" | tee /sys/kernel/mm/transparent_hugepage/enabled
     echo "always" | tee /sys/kernel/mm/transparent_hugepage/defrag
+
+    # PAGR tuning knobs. Defaults keep comparison traces enabled while reducing
+    # prediction fanout and graph/log overhead relative to the first port.
+    set_htmm_knob pagr_fast_threshold_min_percent "${PAGR_FAST_THRESHOLD_MIN_PERCENT:-5}"
+    set_htmm_knob pagr_fast_threshold_power "${PAGR_FAST_THRESHOLD_POWER:-2}"
+    set_htmm_knob pagr_fast_threshold_min_samples "${PAGR_FAST_THRESHOLD_MIN_SAMPLES:-1024}"
+    set_htmm_knob pagr_max_predictions_per_sample "${PAGR_MAX_PREDICTIONS_PER_SAMPLE:-4}"
+    set_htmm_knob pagr_trace_enabled "${PAGR_TRACE:-1}"
+    set_htmm_knob pagr_graph_enabled "${PAGR_GRAPH:-1}"
+    set_htmm_knob pagr_graph_sample_interval "${PAGR_GRAPH_SAMPLE_INTERVAL:-8}"
+    set_htmm_knob pagr_debug_interval_ms "${PAGR_DEBUG_INTERVAL_MS:-0}"
+    set_htmm_knob pagr_verbose "${PAGR_VERBOSE:-0}"
 }
 
 function func_prepare() {
@@ -168,6 +192,12 @@ function func_main() {
     func_cache_flush
     sleep 2
 
+    # stream kernel log to file so long runs don't lose early lines to
+    # ring-buffer wrap (dmesg -c at the end only sees the tail)
+    sudo dmesg -c > /dev/null
+    sudo stdbuf -oL dmesg -w > ${LOG_DIR}/dmesg.txt &
+    DMESG_PID=$!
+
     ${DIR}/scripts/memory_stat.sh ${LOG_DIR} &
     if [[ "x${BENCH_NAME}" =~ "xsilo" ]]; then
 	${TIME} -f "execution time %e (s)" \
@@ -196,7 +226,10 @@ function func_main() {
 	    | awk ' { print $4 }' > ${LOG_DIR}/throughput.out
     fi
 
-    sudo dmesg -c > ${LOG_DIR}/dmesg.txt
+    sleep 1
+    sudo kill ${DMESG_PID} 2> /dev/null
+    # already streamed to dmesg.txt; just clear the ring buffer
+    sudo dmesg -c > /dev/null
     # disable htmm
     sudo ${DIR}/scripts/set_htmm_memcg.sh htmm $$ disable
 }
@@ -303,10 +336,37 @@ fi
 function func_plot() {
 	local app_dir=${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/
 
-	mv /tmp/memtis_pebs_trace.bin ${app_dir}
-	mv /tmp/memtis_pred.bin ${app_dir}
-	mv /tmp/memtis_promote.bin ${app_dir}
-	mv /tmp/memtis_demote.bin ${app_dir}
+	$py_bin ${DIR}/plot_metrics.py \
+		${app_dir}dmesg.txt \
+		--pgmig ${app_dir}pgmig.txt \
+		--output-dir ${app_dir} \
+		--title "${BENCH_NAME} ${VER} ${NVM_RATIO}" \
+		|| echo "WARNING: failed to plot dmesg/pgmig statistics"
+
+	# per-node memory allocation over time (PACT-style mem plot)
+	if [[ -f ${app_dir}numactl.txt ]]; then
+		$py_bin $plot_dir/plot_numactl.py \
+			${app_dir}numactl.txt \
+			${app_dir}mem.png \
+			--labels "node 0 free" "node 1 free" \
+			--title "${BENCH_NAME} ${VER} ${NVM_RATIO} Free Mem" \
+			|| echo "WARNING: failed to plot numactl statistics"
+	fi
+
+	[[ -f /tmp/memtis_pebs_trace.bin ]] && mv /tmp/memtis_pebs_trace.bin ${app_dir}
+	[[ -f /tmp/memtis_pred.bin ]] && mv /tmp/memtis_pred.bin ${app_dir}
+	[[ -f /tmp/memtis_promote.bin ]] && mv /tmp/memtis_promote.bin ${app_dir}
+	[[ -f /tmp/memtis_demote.bin ]] && mv /tmp/memtis_demote.bin ${app_dir}
+
+	if [[ -f /tmp/memtis_pagr_graph.bin ]]; then
+		mv /tmp/memtis_pagr_graph.bin ${app_dir}
+		$py_bin ${DIR}/plot_pagr_graph.py \
+			${app_dir}memtis_pagr_graph.bin \
+			--output ${app_dir}pagr_graph.png \
+			--summary ${app_dir}pagr_graph_edges.csv \
+			--title "${BENCH_NAME} ${VER} ${NVM_RATIO} PAGR graph" \
+			|| echo "WARNING: failed to plot PAGR graph"
+	fi
 	
 
 	if [[ $BENCH_NAME == "cgups" ]]; then
@@ -317,46 +377,58 @@ function func_plot() {
 
 	rm -rf ${app_dir}pred_acc.txt
 
-	$py_bin $plot_dir/plot_cluster_no_app.py \
-		${app_dir}memtis_pebs_trace.bin \
-		--output ${app_dir}plot.png \
-		-fast
+	if [[ -f ${app_dir}memtis_pebs_trace.bin ]]; then
+		$py_bin $plot_dir/plot_cluster_no_app.py \
+			${app_dir}memtis_pebs_trace.bin \
+			--output ${app_dir}plot.png \
+			-fast
+	fi
 
-	$py_bin $plot_dir/plot_cluster_no_app.py \
-		${app_dir}memtis_pred.bin \
-		--output ${app_dir}pred_plot.png \
-		-fast
+	if [[ -f ${app_dir}memtis_pred.bin ]]; then
+		$py_bin $plot_dir/plot_cluster_no_app.py \
+			${app_dir}memtis_pred.bin \
+			--output ${app_dir}pred_plot.png \
+			-fast
+	fi
 
-	$py_bin $plot_dir/plot_cluster_no_app.py \
-		${app_dir}memtis_promote.bin \
-		--output ${app_dir}promote_plot.png \
-		-fast
+	if [[ -f ${app_dir}memtis_promote.bin ]]; then
+		$py_bin $plot_dir/plot_cluster_no_app.py \
+			${app_dir}memtis_promote.bin \
+			--output ${app_dir}promote_plot.png \
+			-fast
+	fi
 
-	$py_bin $plot_dir/plot_cluster_no_app.py \
-		${app_dir}memtis_demote.bin \
-		--output ${app_dir}demote_plot.png \
-		-fast
+	if [[ -f ${app_dir}memtis_demote.bin ]]; then
+		$py_bin $plot_dir/plot_cluster_no_app.py \
+			${app_dir}memtis_demote.bin \
+			--output ${app_dir}demote_plot.png \
+			-fast
+	fi
 
-	$py_bin "${plot_dir}/pred_acc.py" \
-        "${app_dir}/memtis_pebs_trace.bin" \
-        "${app_dir}/memtis_promote.bin" \
-        "${app_dir}/memtis_demote.bin" \
-        >> "${app_dir}/pred_acc.txt"
+	if [[ -f ${app_dir}memtis_pebs_trace.bin && \
+	      -f ${app_dir}memtis_promote.bin && \
+	      -f ${app_dir}memtis_demote.bin ]]; then
+		$py_bin "${plot_dir}/pred_acc.py" \
+		"${app_dir}/memtis_pebs_trace.bin" \
+		"${app_dir}/memtis_promote.bin" \
+		"${app_dir}/memtis_demote.bin" \
+		>> "${app_dir}/pred_acc.txt"
 
 
-    $py_bin "${plot_dir}/plot_timeliness.py" \
-        "${app_dir}/memtis_pebs_trace.bin" \
-        "${app_dir}/memtis_promote.bin" \
-        "${app_dir}/memtis_demote.bin" \
-        --output "${app_dir}/timeliness.png" \
-        >> "${app_dir}/pred_acc.txt"
+		$py_bin "${plot_dir}/plot_timeliness.py" \
+		"${app_dir}/memtis_pebs_trace.bin" \
+		"${app_dir}/memtis_promote.bin" \
+		"${app_dir}/memtis_demote.bin" \
+		--output "${app_dir}/timeliness.png" \
+		>> "${app_dir}/pred_acc.txt"
 
-    $py_bin "${plot_dir}/cost_benefit.py" \
-        "${app_dir}/memtis_pebs_trace.bin" \
-        "${app_dir}/memtis_promote.bin" \
-        "${app_dir}/memtis_demote.bin" \
-        --output "${app_dir}/cost_benefit.png" \
-        >> "${app_dir}/pred_acc.txt"
+		$py_bin "${plot_dir}/cost_benefit.py" \
+		"${app_dir}/memtis_pebs_trace.bin" \
+		"${app_dir}/memtis_promote.bin" \
+		"${app_dir}/memtis_demote.bin" \
+		--output "${app_dir}/cost_benefit.png" \
+		>> "${app_dir}/pred_acc.txt"
+	fi
 
 	# $py_bin "${plot_dir}/plot_pred_acc.py" \
     #     ${DIR}/results/${BENCH_NAME}/${VER}/${NVM_RATIO}/memtis_pebs_trace.bin \

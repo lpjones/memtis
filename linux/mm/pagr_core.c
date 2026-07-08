@@ -15,8 +15,10 @@
 #include <linux/sched/task.h>
 #include <linux/xarray.h>
 #include <linux/math.h>
+#include <linux/mutex.h>
 #include <linux/random.h>
 #include <trace/events/htmm.h>
+#include <asm/msr.h>
 
 static struct file *memtis_pred_file;
 static loff_t memtis_pred_pos;
@@ -24,6 +26,9 @@ static struct file *memtis_promote_file;
 static loff_t memtis_promote_pos;
 static struct file *memtis_demote_file;
 static loff_t memtis_demote_pos;
+static struct file *memtis_pagr_graph_file;
+static loff_t memtis_pagr_graph_pos;
+static DEFINE_MUTEX(memtis_pagr_graph_mutex);
 
 struct pebs_rec {
   uint64_t cyc;
@@ -38,39 +43,71 @@ struct pebs_rec {
 
 int htmm_pred_log_start(void)
 {
-	if (memtis_pred_file)
+	struct pagr_graph_header graph_header;
+
+	if (memtis_pred_file || memtis_promote_file || memtis_demote_file ||
+	    memtis_pagr_graph_file)
 		return 0;
 
-	memtis_pred_file = filp_open("/tmp/memtis_pred.bin",
-				     O_WRONLY | O_CREAT | O_TRUNC,
-				     0600);
-	if (IS_ERR(memtis_pred_file)) {
-		int err = PTR_ERR(memtis_pred_file);
+	if (READ_ONCE(pagr_trace_enabled)) {
+		memtis_pred_file = filp_open("/tmp/memtis_pred.bin",
+					     O_WRONLY | O_CREAT | O_TRUNC,
+					     0600);
+		if (IS_ERR(memtis_pred_file)) {
+			pr_warn("htmm: failed to open memtis pred file (%ld)\n",
+				PTR_ERR(memtis_pred_file));
+			memtis_pred_file = NULL;
+		}
 
-		printk("failed to open memtis pred file: %d\n", err);
-		memtis_pred_file = NULL;
-		return err;
+		memtis_promote_file = filp_open("/tmp/memtis_promote.bin",
+					     O_WRONLY | O_CREAT | O_TRUNC,
+					     0600);
+		if (IS_ERR(memtis_promote_file)) {
+			pr_warn("htmm: failed to open memtis promote file (%ld)\n",
+				PTR_ERR(memtis_promote_file));
+			memtis_promote_file = NULL;
+		}
+
+		memtis_demote_file = filp_open("/tmp/memtis_demote.bin",
+					    O_WRONLY | O_CREAT | O_TRUNC,
+					    0600);
+		if (IS_ERR(memtis_demote_file)) {
+			pr_warn("htmm: failed to open memtis demote file (%ld)\n",
+				PTR_ERR(memtis_demote_file));
+			memtis_demote_file = NULL;
+		}
 	}
 
-	memtis_promote_file = filp_open("/tmp/memtis_promote.bin",
-				     O_WRONLY | O_CREAT | O_TRUNC,
-				     0600);
-	if (IS_ERR(memtis_promote_file)) {
-		pr_warn("htmm: failed to open memtis promote file\n");
-		memtis_promote_file = NULL;
-	}
-
-	memtis_demote_file = filp_open("/tmp/memtis_demote.bin",
-				    O_WRONLY | O_CREAT | O_TRUNC,
-				    0600);
-	if (IS_ERR(memtis_demote_file)) {
-		pr_warn("htmm: failed to open memtis demote file\n");
-		memtis_demote_file = NULL;
+	if (READ_ONCE(pagr_graph_enabled)) {
+		memtis_pagr_graph_file = filp_open("/tmp/memtis_pagr_graph.bin",
+					    O_WRONLY | O_CREAT | O_TRUNC,
+					    0600);
+		if (IS_ERR(memtis_pagr_graph_file)) {
+			pr_warn("htmm: failed to open PAGR graph file (%ld)\n",
+				PTR_ERR(memtis_pagr_graph_file));
+			memtis_pagr_graph_file = NULL;
+		}
 	}
 
 	memtis_pred_pos = 0;
 	memtis_promote_pos = 0;
 	memtis_demote_pos = 0;
+	memtis_pagr_graph_pos = 0;
+
+	if (memtis_pagr_graph_file) {
+		ssize_t written;
+
+		graph_header.magic = PAGR_GRAPH_MAGIC;
+		graph_header.version = PAGR_GRAPH_VERSION;
+		graph_header.record_size = sizeof(struct pagr_graph_record);
+		written = kernel_write(memtis_pagr_graph_file,
+				       &graph_header,
+				       sizeof(graph_header),
+				       &memtis_pagr_graph_pos);
+		if (written != (ssize_t)sizeof(graph_header))
+			pr_warn("htmm: PAGR graph header write failed (%zd)\n",
+				written);
+	}
 	return 0;
 }
 
@@ -91,6 +128,40 @@ void htmm_pred_log_stop(void)
 		memtis_demote_file = NULL;
 		memtis_demote_pos = 0;
 	}
+	mutex_lock(&memtis_pagr_graph_mutex);
+	if (memtis_pagr_graph_file) {
+		filp_close(memtis_pagr_graph_file, NULL);
+		memtis_pagr_graph_file = NULL;
+		memtis_pagr_graph_pos = 0;
+	}
+	mutex_unlock(&memtis_pagr_graph_mutex);
+}
+
+void htmm_log_pagr_graph_records(struct pagr_graph_record *records,
+				 unsigned int nr_records)
+{
+	size_t bytes;
+	ssize_t written;
+	unsigned int i;
+
+	if (!READ_ONCE(pagr_graph_enabled) || !records || !nr_records)
+		return;
+
+	for (i = 0; i < nr_records; i++)
+		records[i].log_cyc = rdtsc();
+
+	bytes = sizeof(*records) * nr_records;
+	mutex_lock(&memtis_pagr_graph_mutex);
+	if (!memtis_pagr_graph_file) {
+		mutex_unlock(&memtis_pagr_graph_mutex);
+		return;
+	}
+	written = kernel_write(memtis_pagr_graph_file, records, bytes,
+			       &memtis_pagr_graph_pos);
+	mutex_unlock(&memtis_pagr_graph_mutex);
+	if (written != (ssize_t)bytes)
+		pr_warn_ratelimited("htmm: PAGR graph write failed (%zd/%zu)\n",
+				    written, bytes);
 }
 
 void htmm_log_page_migration(struct page *page,
@@ -107,7 +178,8 @@ void htmm_log_page_migration(struct page *page,
 	if (reason != MR_NUMA_MISPLACED)
 		return;
 
-	if (!memtis_promote_file && !memtis_demote_file)
+	if (!READ_ONCE(pagr_trace_enabled) ||
+	    (!memtis_promote_file && !memtis_demote_file))
 		return;
 
 	src_nid = page_to_nid(page);
@@ -1200,7 +1272,7 @@ static bool update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 		rec.ip = pred_ip;
 		rec.cpu = smp_processor_id();
 		rec.evt = 0;
-		if (memtis_pred_file) {
+		if (READ_ONCE(pagr_trace_enabled) && memtis_pred_file) {
 			ssize_t written;
 
 			written = kernel_write(memtis_pred_file,
@@ -1257,7 +1329,7 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
     hot = update_base_page(vma, page, pginfo, address);
     pte_unmap_unlock(pte, ptl);
 
-    if (hot) {
+    if (hot && READ_ONCE(pagr_trace_enabled)) {
 	struct pebs_rec rec;
 	rec.cyc = rdtsc();
 	rec.va = address;
@@ -1349,7 +1421,7 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 			rec.ip = 0;
 			rec.cpu = 0;
 			rec.evt = 0;
-			if (memtis_pred_file) {
+			if (READ_ONCE(pagr_trace_enabled) && memtis_pred_file) {
 				ssize_t written;
 
 				written = kernel_write(memtis_pred_file,
@@ -1647,72 +1719,50 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned lon
     static unsigned long last_thres_adaptation;
     last_thres_adaptation= jiffies;
 
-	printk_ratelimited("PAGR: update_pginfo\n");
-
     if (htmm_mode == HTMM_NO_MIG)
 	goto put_task;
-
-	printk_ratelimited("PAGR: update_pginfo 1\n");
 
     if (!mm) {
 	goto put_task;
     }
 
-	printk_ratelimited("PAGR: update_pginfo 2\n");
-
     if (!mmap_read_trylock(mm))
 	goto put_task;
-
-	printk_ratelimited("PAGR: update_pginfo 3\n");
 
     vma = find_vma(mm, address);
     if (unlikely(!vma))
 	goto mmap_unlock;
-
-	printk_ratelimited("PAGR: update_pginfo 4\n");
 
     
     if (!vma->vm_mm || !vma_migratable(vma) ||
 	(vma->vm_file && (vma->vm_flags & (VM_READ | VM_WRITE)) == (VM_READ)))
 		goto mmap_unlock;
 
-	printk_ratelimited("PAGR: update_pginfo 5\n");
-    
     memcg = get_mem_cgroup_from_mm(mm);
 	if (!memcg)
 		goto mmap_unlock;
     // if (!memcg || !memcg->htmm_enabled)
 	// goto mmap_unlock;
 
-	printk_ratelimited("PAGR: update_pginfo 6\n");
-    
     /* increase sample counts only for valid records */
     ret = __update_pginfo(vma, address, cyc, ip);
     if (ret == 1) { /* memory accesses to DRAM */
-		printk_ratelimited("PAGR: update_pginfo 7\n");
 		memcg->nr_sampled++;
 		memcg->nr_sampled_for_split++;
 		memcg->nr_dram_sampled++;
 		memcg->nr_max_sampled++;
     } else if (ret == 2) {
-		printk_ratelimited("PAGR: update_pginfo 8\n");
 		memcg->nr_sampled++;
 		memcg->nr_sampled_for_split++;
 		memcg->nr_max_sampled++;
     } else {
-		printk_ratelimited("PAGR: update_pginfo 9\n");
 		goto mmap_unlock;
 	}
-	printk_ratelimited("PAGR: update_pginfo 9.1\n");
     /* cooling and split decision */
     if (memcg->nr_sampled % htmm_cooling_period == 0 ||
 	    need_memcg_cooling(memcg)) {
-		printk_ratelimited("PAGR: update_pginfo 10\n");
-
 	/* cooling -- updates thresholds and sets need_cooling flags */
 		if (__cooling(mm, memcg)) {
-			printk_ratelimited("PAGR: update_pginfo 11\n");
-
 			unsigned long temp_rhr = memcg->prev_dram_sampled;
 			/* updates actual access stat */
 			memcg->prev_dram_sampled >>= 1;
@@ -1726,8 +1776,6 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned lon
 			/* split decision period */
 			/* split should be performed after cooling due to skewness factor */
 			if (!memcg->need_split && htmm_thres_split) {
-				printk_ratelimited("PAGR: update_pginfo 12\n");
-
 				unsigned long usage = page_counter_read(&memcg->memory);
 				/* htmm_split_period: 2 by default
 				* This means that the number of sampled records should 
@@ -1738,16 +1786,10 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned lon
 				usage = max(usage, memcg->max_nr_dram_pages);
 				
 				if (memcg->nr_sampled_for_split > usage) {
-					printk_ratelimited("PAGR: update_pginfo 13\n");
-
 					/* if split is already performed in the previous
 					* and rhr is not improved, stop split huge pages */
 					if (memcg->split_happen) {
-						printk_ratelimited("PAGR: update_pginfo 14\n");
-
 						if (memcg->prev_dram_sampled < (temp_rhr * 103 / 100)) { // 3%
-							printk_ratelimited("PAGR: update_pginfo 15\n");
-
 							htmm_thres_split = 0;
 							goto mmap_unlock;
 						}
@@ -1755,30 +1797,25 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e, unsigned lon
 					memcg->split_happen = false;
 					memcg->need_split = true;
 				} else {
-					printk_ratelimited("PAGR: update_pginfo 16\n");
-
 					/* re-calculate split threshold due to cooling */
 					memcg->nr_split = memcg->nr_split + memcg->nr_split_tail_idx;
 					memcg->nr_split_tail_idx = 0;
 					set_memcg_split_thres(memcg);
 				}
-				printk_ratelimited("PAGR: update_pginfo 16.1\n");
 			}
-			printk("total_accesses: %lu max_dram_hits: %lu cur_hits: %lu \n",
-				memcg->nr_max_sampled, memcg->prev_max_dram_sampled, memcg->prev_dram_sampled);
+			if (READ_ONCE(pagr_verbose))
+				printk("total_accesses: %lu max_dram_hits: %lu cur_hits: %lu\n",
+				       memcg->nr_max_sampled,
+				       memcg->prev_max_dram_sampled,
+				       memcg->prev_dram_sampled);
 			memcg->nr_max_sampled >>= 1;
 		}
-		printk_ratelimited("PAGR: update_pginfo 16.2\n");
     } else if (memcg->nr_sampled % htmm_adaptation_period == 0) { /* threshold adaptation */
-		printk_ratelimited("PAGR: update_pginfo 17\n");
-		
 		__adjust_active_threshold(mm, memcg);
     }
 
 mmap_unlock:
-	printk_ratelimited("PAGR: update_pginfo 18\n");
     mmap_read_unlock(mm);
 put_task:
-	printk_ratelimited("PAGR: update_pginfo 19\n");
     put_pid(pid_struct);
 }

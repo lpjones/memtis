@@ -275,9 +275,7 @@ bench_runner::run()
 	    if (workers[i]->check_bench_end())
 		end = 1;
 	}
-    } while (!end);
-    //while (elapsed_time < runtime && !end);
-    //sleep(runtime);
+    } while (run_mode == RUNMODE_TIME ? elapsed_time < runtime : !end);
     running = false;
   }
   __sync_synchronize();

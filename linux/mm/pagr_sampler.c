@@ -83,7 +83,8 @@ static inline bool htmm_perf_rb_copy(struct perf_buffer *rb, u64 offset,
 	size_t copied = 0;
 
 	if (!rb || !dst || !size || !rb->nr_pages) {
-		printk("invalid argument(s) for htmm_perf_rb_copy\n");
+		if (READ_ONCE(pagr_verbose))
+			printk("invalid argument(s) for htmm_perf_rb_copy\n");
 		return false;
 	}
 
@@ -163,7 +164,9 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
 	// __pid = pid;
 	__pid = -1; // for system-wide sampling, set pid to -1 to capture events from all processes
 
-	printk("pid: %d, cpu: %llu, event: %llu\n", __pid, cpu, config);
+	if (READ_ONCE(pagr_verbose))
+		printk("pid: %d, cpu: %llu, event: %llu\n",
+		       __pid, cpu, config);
 	
     // event_fd = htmm__perf_event_open(&attr, __pid, cpu, -1, 0);
     event_fd = htmm__perf_event_open(&attr, -1, cpu, -1, 0);
@@ -187,10 +190,11 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
 
     mem_event[cpu][type] = file->private_data;
 	mem_event_files[cpu][type] = file;
-    printk("[pebs_open] cpu=%llu, event=%llu, perf_event=%p, state=%d, period=%lld\n",
-    	   cpu, config, mem_event[cpu][type],
-    	   mem_event[cpu][type]->state,
-	   local64_read(&mem_event[cpu][type]->hw.period_left));
+    if (READ_ONCE(pagr_verbose))
+	printk("[pebs_open] cpu=%llu, event=%llu, perf_event=%p, state=%d, period=%lld\n",
+	       cpu, config, mem_event[cpu][type],
+	       mem_event[cpu][type]->state,
+	       local64_read(&mem_event[cpu][type]->hw.period_left));
     return 0;
 }
 
@@ -280,14 +284,15 @@ static void pebs_enable(void)
 	if (!mem_event)
 		return;
 
-	memtis_trace_file = filp_open("/tmp/memtis_pebs_trace.bin",
-				     O_WRONLY | O_CREAT | O_TRUNC,
-				     0600);
-	if (IS_ERR(memtis_trace_file)) {
-		printk("failed to open memtis trace file: %ld\n",
-		       PTR_ERR(memtis_trace_file));
-		memtis_trace_file = NULL;
-		return;
+	if (READ_ONCE(pagr_trace_enabled)) {
+		memtis_trace_file = filp_open("/tmp/memtis_pebs_trace.bin",
+					     O_WRONLY | O_CREAT | O_TRUNC,
+					     0600);
+		if (IS_ERR(memtis_trace_file)) {
+			printk("failed to open memtis trace file: %ld\n",
+			       PTR_ERR(memtis_trace_file));
+			memtis_trace_file = NULL;
+		}
 	}
 	memtis_trace_pos = 0;
 	if (htmm_pred_log_start())
@@ -299,14 +304,16 @@ static void pebs_enable(void)
 	for (event = 0; event < N_HTMMEVENTS; event++) {
 	    if (mem_event[cpu][event]) {
 	    	struct perf_event *e = mem_event[cpu][event];
-	    	printk("[enable_evt] cpu=%d event=%d config=%llu state_before=%d\n",
-	    	       cpu, event, e->attr.config, e->state);
+		if (READ_ONCE(pagr_verbose))
+		    printk("[enable_evt] cpu=%d event=%d config=%llu state_before=%d\n",
+			   cpu, event, e->attr.config, e->state);
 		perf_event_enable(mem_event[cpu][event]);
 		enabled_count++;
 	    }
 	}
     }
-    printk("[enable_done] total_enabled=%d\n", enabled_count);
+    if (READ_ONCE(pagr_verbose))
+	printk("[enable_done] total_enabled=%d\n", enabled_count);
 }
 
 static void pebs_update_period(uint64_t value, uint64_t inst_value)
@@ -482,7 +489,9 @@ static int ksamplingd(void *data)
 								    written);
 				}
 
-				printk_ratelimited("Updating page: va: %llx, cyc: %llu, ip: %llx\n", he.addr, rec.cyc, rec.ip);
+				if (READ_ONCE(pagr_verbose))
+					printk_ratelimited("Updating page: va: %llx, cyc: %llu, ip: %llx\n",
+							   he.addr, rec.cyc, rec.ip);
 			    update_pginfo(he.pid, he.addr, event, rec.cyc, rec.ip);
 
 			    //count_vm_event(HTMM_NR_SAMPLED);
@@ -491,10 +500,12 @@ static int ksamplingd(void *data)
 			    if (event == DRAMREAD) {
 				nr_dram++;
 				hr_dram++;
+				pagr_note_access(true);
 			    }
 			    else if (event == CXLREAD || event == NVMREAD) {
 				nr_nvm++;
 				hr_nvm++;
+				pagr_note_access(false);
 			    }
 			    else
 				nr_write++;
@@ -587,10 +598,13 @@ static int ksamplingd(void *data)
 	    prev_promoted = vm_events[HTMM_NR_PROMOTED];
 	    prev_demoted = vm_events[HTMM_NR_DEMOTED];
 
-	    pr_info("sample_period: %lu || cputime: %lu || hit_ratio: %lu || promoted: %lu || demoted: %lu\n",
-		    get_sample_period(sample_period), trace_cputime, hr, promoted_per_sec, demoted_per_sec);
+	    pr_info("sample_period: %lu || cputime: %lu || hit_ratio: %lu || promoted: %lu || demoted: %lu || fast: %lu || slow: %lu\n",
+		    get_sample_period(sample_period), trace_cputime, hr,
+		    promoted_per_sec, demoted_per_sec, hr_dram, hr_nvm);
 	    
 	    hr_dram = hr_nvm = 0;
+	    /* reset the percent-fast window used for PAGR threshold scaling */
+	    pagr_reset_access_counters();
 	    trace_cputime = cur;
 	    trace_runtime = cur_runtime;
 	}

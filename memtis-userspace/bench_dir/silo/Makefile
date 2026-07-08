@@ -87,7 +87,9 @@ endif
 ifeq ($(DEBUG_S),1)
         CXXFLAGS += -fno-omit-frame-pointer -DDEBUG
 else
-        CXXFLAGS += -Werror -O2 -funroll-loops -fno-omit-frame-pointer
+        CXXFLAGS += -O2 -funroll-loops -fno-omit-frame-pointer
+        # gcc-13: old masstree/silo code trips deprecated warnings; don't -Werror
+        CXXFLAGS += -Wno-error -Wno-deprecated-declarations
 endif
 ifeq ($(CHECK_INVARIANTS_S),1)
 	CXXFLAGS += -DCHECK_INVARIANTS

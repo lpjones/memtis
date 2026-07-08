@@ -3050,6 +3050,15 @@ bool htmm_cxl_mode = false;
 bool htmm_skip_cooling = true;
 unsigned int htmm_thres_cooling_alloc = 256 * 1024 * 10; // unit: 4KiB, default: 10GB
 unsigned int ksampled_soft_cpu_quota = 30; // 3 %
+unsigned int pagr_fast_threshold_min_percent = 5;
+unsigned int pagr_fast_threshold_power = 2;
+unsigned int pagr_fast_threshold_min_samples = 1024;
+unsigned int pagr_max_predictions_per_sample = 4;
+unsigned int pagr_trace_enabled = 1;
+unsigned int pagr_graph_enabled = 1;
+unsigned int pagr_graph_sample_interval = 8;
+unsigned int pagr_debug_interval_ms = 0;
+unsigned int pagr_verbose = 0;
 #endif
 
 #ifdef CONFIG_SYSFS
@@ -3607,7 +3616,40 @@ static struct kobj_attribute htmm_thres_cooling_alloc_attr =
 	__ATTR(htmm_thres_cooling_alloc, 0644, htmm_thres_cooling_alloc_show,
 	       htmm_thres_cooling_alloc_store);
 
+#define PAGR_UINT_SYSFS_ATTR(name)						\
+static ssize_t name##_show(struct kobject *kobj,				\
+			   struct kobj_attribute *attr, char *buf)		\
+{										\
+	return sysfs_emit(buf, "%u\n", READ_ONCE(name));			\
+}										\
+										\
+static ssize_t name##_store(struct kobject *kobj,				\
+			    struct kobj_attribute *attr,			\
+			    const char *buf, size_t count)			\
+{										\
+	int err;								\
+	unsigned int value;							\
+										\
+	err = kstrtouint(buf, 10, &value);					\
+	if (err)								\
+		return err;							\
+										\
+	WRITE_ONCE(name, value);						\
+	return count;								\
+}										\
+										\
+static struct kobj_attribute name##_attr =					\
+	__ATTR(name, 0644, name##_show, name##_store)
 
+PAGR_UINT_SYSFS_ATTR(pagr_fast_threshold_min_percent);
+PAGR_UINT_SYSFS_ATTR(pagr_fast_threshold_power);
+PAGR_UINT_SYSFS_ATTR(pagr_fast_threshold_min_samples);
+PAGR_UINT_SYSFS_ATTR(pagr_max_predictions_per_sample);
+PAGR_UINT_SYSFS_ATTR(pagr_trace_enabled);
+PAGR_UINT_SYSFS_ATTR(pagr_graph_enabled);
+PAGR_UINT_SYSFS_ATTR(pagr_graph_sample_interval);
+PAGR_UINT_SYSFS_ATTR(pagr_debug_interval_ms);
+PAGR_UINT_SYSFS_ATTR(pagr_verbose);
 
 static struct attribute *htmm_attrs[] = {
 	&htmm_sample_period_attr.attr,
@@ -3629,6 +3671,15 @@ static struct attribute *htmm_attrs[] = {
 	&htmm_cxl_mode_attr.attr,
 	&htmm_skip_cooling_attr.attr,
 	&htmm_thres_cooling_alloc_attr.attr,
+	&pagr_fast_threshold_min_percent_attr.attr,
+	&pagr_fast_threshold_power_attr.attr,
+	&pagr_fast_threshold_min_samples_attr.attr,
+	&pagr_max_predictions_per_sample_attr.attr,
+	&pagr_trace_enabled_attr.attr,
+	&pagr_graph_enabled_attr.attr,
+	&pagr_graph_sample_interval_attr.attr,
+	&pagr_debug_interval_ms_attr.attr,
+	&pagr_verbose_attr.attr,
 	NULL,
 };
 

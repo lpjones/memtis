@@ -1,24 +1,26 @@
 #!/bin/bash
 
-BIN=/path/to/benchmark
-BENCH_RUN="${BIN}/bench_btree_mt"
-BENCH_DRAM=""
+BIN=/proj/TppPlus/tpp/workloads/vmitosis-workloads/bin
 
+# NELEMENTS = 200M (btree.c) => ~21GB resident on this testbed
+BENCH_RUN="${BIN}/bench_btree_mt"
+BENCH_DRAM="max"
+BENCH_DRAM_BUFFER_MB="1024"
 
 if [[ "x${NVM_RATIO}" == "x1:16" ]]; then
-    BENCH_DRAM="2350MB"
+    BENCH_DRAM="1300MB"
 elif [[ "x${NVM_RATIO}" == "x1:8" ]]; then
-    BENCH_DRAM="4500MB"
+    BENCH_DRAM="2400MB"
 elif [[ "x${NVM_RATIO}" == "x1:4" ]]; then
-    BENCH_DRAM="7870MB"
+    BENCH_DRAM="4300MB"
 elif [[ "x${NVM_RATIO}" == "x1:2" ]]; then
-    BENCH_DRAM="13100MB"
+    BENCH_DRAM="7100MB"
 elif [[ "x${NVM_RATIO}" == "x1:1" ]]; then
-    BENCH_DRAM="19675MB"
+    BENCH_DRAM="10600MB"
 elif [[ "x${NVM_RATIO}" == "x1:0" ]]; then
-    BENCH_DRAM="75000MB"
+    BENCH_DRAM="25000MB"
 fi
-
 
 export BENCH_RUN
 export BENCH_DRAM
+export BENCH_DRAM_BUFFER_MB
