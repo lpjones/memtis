@@ -50,6 +50,7 @@ for BENCH in "${BENCHES[@]}"; do
     ${DIR}/scripts/run_bench.sh --cxl -B ${BENCH} -V ${VER} \
         > ${DIR}/results/${BENCH}_${VER}_console.log 2>&1
     rc=$?
+    mv ${DIR}/results/${BENCH}_${VER}_console.log ${DIR}/results/${BENCH}/${VER}_console.log
     echo "==== [$(date +%H:%M:%S)] finished ${BENCH} rc=${rc} ====" | tee -a ${SUMMARY}
 done
 
