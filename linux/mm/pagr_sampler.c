@@ -355,7 +355,6 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 
 static int ksamplingd(void *data)
 {
-	printk("PAGR ksamplingd\n");
     unsigned long long nr_sampled = 0, nr_dram = 0, nr_nvm = 0, nr_write = 0;
     unsigned long long nr_throttled = 0, nr_lost = 0, nr_unknown = 0;
     unsigned long long nr_skip = 0;
@@ -382,6 +381,16 @@ static int ksamplingd(void *data)
 
     /* for analytic purpose */
     unsigned long hr_dram = 0, hr_nvm = 0;
+
+    /*
+     * EMA of the per-second fast-tier hit ratio (basis points, 0-10000),
+     * used to detect hotset shifts: a sharp drop below the EMA resets the
+     * PEBS period to the minimum so the new hot region is sampled densely
+     * enough to be promoted.  The CPU-quota controller then ratchets the
+     * period back up once the transition is over.
+     */
+    unsigned long hr_ema = 0;
+    bool hr_ema_valid = false;
 
     /* orig impl: see read_sum_exec_runtime() */
     trace_runtime = total_runtime = exec_runtime = t->se.sum_exec_runtime;
@@ -566,8 +575,18 @@ static int ksamplingd(void *data)
 		    pebs_update_period(get_sample_period(sample_period),
 				       get_sample_inst_period(sample_inst_period));
 	    } else if (cputime < (ksampled_soft_cpu_quota - 5) && sample_period) {
+		/*
+		 * Asymmetric controller: increase by 1 index/sec but drop
+		 * several indices at once, so the sample rate recovers
+		 * quickly when CPU headroom appears.
+		 */
 		unsigned long tmp1 = sample_period, tmp2 = sample_inst_period;
-		decrease_sample_period(&sample_period, &sample_inst_period);
+		unsigned int step = max_t(unsigned int,
+					  READ_ONCE(pagr_period_dec_step), 1);
+		unsigned int i;
+
+		for (i = 0; i < step && sample_period; i++)
+		    decrease_sample_period(&sample_period, &sample_inst_period);
 		if (tmp1 != sample_period || tmp2 != sample_inst_period)
 		    pebs_update_period(get_sample_period(sample_period),
 				    get_sample_inst_period(sample_inst_period));
@@ -591,6 +610,37 @@ static int ksamplingd(void *data)
 		hr = 0;
 	    else
 		hr = hr_dram * 10000 / (hr_dram + hr_nvm);
+
+	    /*
+	     * Hotset-shift detection: a sharp drop of the hit ratio below
+	     * its EMA means the hot working set moved to slow memory.
+	     * Reset the PEBS period to the minimum immediately instead of
+	     * waiting for the CPU-quota controller, so PAGR sees enough
+	     * samples of the new region to promote it.
+	     */
+	    if (hr_dram + hr_nvm >= READ_ONCE(pagr_hr_reset_min_samples)) {
+		unsigned long drop_bp =
+			(unsigned long)READ_ONCE(pagr_hr_reset_drop) * 100;
+
+		if (drop_bp && hr_ema_valid &&
+		    hr + drop_bp < hr_ema && sample_period) {
+		    pr_info("pagr: hit ratio dropped (%lu -> %lu), resetting sample period %lu -> %lu\n",
+			    hr_ema, hr, get_sample_period(sample_period),
+			    get_sample_period(0));
+		    sample_period = 0;
+		    sample_inst_period = 0;
+		    pebs_update_period(get_sample_period(sample_period),
+				       get_sample_inst_period(sample_inst_period));
+		    /* restart the EMA from the post-shift hit ratio */
+		    hr_ema = hr;
+		} else if (!hr_ema_valid) {
+		    hr_ema = hr;
+		    hr_ema_valid = true;
+		} else {
+		    /* EMA with scale factor 0.2 */
+		    hr_ema = (2 * hr + 8 * hr_ema) / 10;
+		}
+	    }
 
 	    all_vm_events(vm_events);
 	    promoted_per_sec = vm_events[HTMM_NR_PROMOTED] - prev_promoted;

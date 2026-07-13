@@ -3054,6 +3054,15 @@ unsigned int pagr_fast_threshold_min_percent = 5;
 unsigned int pagr_fast_threshold_power = 2;
 unsigned int pagr_fast_threshold_min_samples = 1024;
 unsigned int pagr_max_predictions_per_sample = 4;
+/*
+ * Hit-ratio-triggered sample period reset: when the per-second fast-tier
+ * hit ratio drops by more than pagr_hr_reset_drop percentage points below
+ * its EMA, ksamplingd resets the PEBS period to the minimum so the sampler
+ * can re-identify a shifted hotset quickly.  Set drop to 0 to disable.
+ */
+unsigned int pagr_hr_reset_drop = 15;		// percentage points
+unsigned int pagr_hr_reset_min_samples = 256;	// min samples/sec to trust hr
+unsigned int pagr_period_dec_step = 4;		// period indices per decrease
 unsigned int pagr_trace_enabled = 1;
 unsigned int pagr_graph_enabled = 1;
 unsigned int pagr_graph_sample_interval = 8;
@@ -3645,6 +3654,9 @@ PAGR_UINT_SYSFS_ATTR(pagr_fast_threshold_min_percent);
 PAGR_UINT_SYSFS_ATTR(pagr_fast_threshold_power);
 PAGR_UINT_SYSFS_ATTR(pagr_fast_threshold_min_samples);
 PAGR_UINT_SYSFS_ATTR(pagr_max_predictions_per_sample);
+PAGR_UINT_SYSFS_ATTR(pagr_hr_reset_drop);
+PAGR_UINT_SYSFS_ATTR(pagr_hr_reset_min_samples);
+PAGR_UINT_SYSFS_ATTR(pagr_period_dec_step);
 PAGR_UINT_SYSFS_ATTR(pagr_trace_enabled);
 PAGR_UINT_SYSFS_ATTR(pagr_graph_enabled);
 PAGR_UINT_SYSFS_ATTR(pagr_graph_sample_interval);
@@ -3675,6 +3687,9 @@ static struct attribute *htmm_attrs[] = {
 	&pagr_fast_threshold_power_attr.attr,
 	&pagr_fast_threshold_min_samples_attr.attr,
 	&pagr_max_predictions_per_sample_attr.attr,
+	&pagr_hr_reset_drop_attr.attr,
+	&pagr_hr_reset_min_samples_attr.attr,
+	&pagr_period_dec_step_attr.attr,
 	&pagr_trace_enabled_attr.attr,
 	&pagr_graph_enabled_attr.attr,
 	&pagr_graph_sample_interval_attr.attr,

@@ -6,7 +6,7 @@ BIN=/proj/TppPlus/tpp/workloads/gapbs
 GRAPH_DIR=/mnt/pact_storage/workloads/gapbs
 
 # twitter-2010: ~9.7GB resident (both CSR directions touched)
-BENCH_RUN="${BIN}/bfs -f ${GRAPH_DIR}/twitter-2010-fixed.sg -n 64 -r 0"
+BENCH_RUN="${BIN}/bfs -f ${GRAPH_DIR}/twitter-2010-fixed.sg -n 256 -r 0"
 BENCH_DRAM="max"
 BENCH_DRAM_BUFFER_MB="1024"
 

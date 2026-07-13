@@ -5,7 +5,7 @@ BIN=/proj/TppPlus/tpp/workloads/gapbs
 # (negative neighbor ids -> pr segfault); rebuilt from the valid out-CSR
 GRAPH_DIR=/mnt/pact_storage/workloads/gapbs
 
-BENCH_RUN="${BIN}/pr -f ${GRAPH_DIR}/twitter-2010-fixed.sg -i1000 -t1e-4 -n20"
+BENCH_RUN="${BIN}/pr -f ${GRAPH_DIR}/twitter-2010-fixed.sg -i1000 -t1e-4 -n256"
 BENCH_DRAM="max"
 BENCH_DRAM_BUFFER_MB="1024"
 
