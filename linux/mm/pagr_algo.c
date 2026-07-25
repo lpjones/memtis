@@ -503,6 +503,37 @@ static inline u64 update_mig_time(u64 avg, u64 val)
 		(PAGR_SCALE - PAGR_DEC_MIG_NUM) * avg) / PAGR_SCALE;
 }
 
+static u64 pagr_mul_sat(u64 a, u64 b)
+{
+	if (a && b > div64_u64(U64_MAX, a))
+		return U64_MAX;
+
+	return a * b;
+}
+
+/*
+ * x86's mul_u64_u64_div_u64() raises #DE when the 128-bit quotient does
+ * not fit in u64.  PAGR deliberately saturates large raw differences, so
+ * detect that condition before entering the architecture helper.
+ */
+static u64 pagr_mul_div_sat(u64 a, u64 mul, u64 div)
+{
+	if (!div)
+		return U64_MAX;
+	if (mul_u64_u64_shr(a, mul, 64) >= div)
+		return U64_MAX;
+
+	return mul_u64_u64_div_u64(a, mul, div);
+}
+
+static u64 pagr_add_sat(u64 a, u64 b)
+{
+	if (b > U64_MAX - a)
+		return U64_MAX;
+
+	return a + b;
+}
+
 static u64 scaled_clipped_diff(u64 diff, u64 low, u64 high)
 {
 	if (diff < DIV_ROUND_UP_ULL(low, PAGR_SCALE))
@@ -521,7 +552,8 @@ static u64 scaled_diff(u64 diff)
 
 static u64 normalize_diff(u64 diff, u64 *top, u64 *bot)
 {
-	u64 clipped = scaled_clipped_diff(diff, *bot / 10, *top * 10);
+	u64 clipped = scaled_clipped_diff(diff, *bot / 10,
+					   pagr_mul_sat(*top, 10));
 	u64 scaled = scaled_diff(diff);
 	u64 delta;
 
@@ -532,7 +564,7 @@ static u64 normalize_diff(u64 diff, u64 *top, u64 *bot)
 		return 0;
 
 	delta = PAGR_ABS_DIFF(scaled, *bot);
-	return mul_u64_u64_div_u64(delta, PAGR_SCALE, *top - *bot);
+	return pagr_mul_div_sat(delta, PAGR_SCALE, *top - *bot);
 }
 
 static u64 calc_distance(struct pagr_entry *a, struct pagr_entry *b)
@@ -546,8 +578,9 @@ static u64 calc_distance(struct pagr_entry *a, struct pagr_entry *b)
 	ip_diff = normalize_diff(PAGR_ABS_DIFF(a->ip, b->ip),
 				 &top_ip, &bot_ip);
 
-	distance = va_diff + cyc_diff + ip_diff;
-	dist_clip = PAGR_CLIP(distance, pagr_bot_dist / 10, pagr_avg_dist * 10);
+	distance = pagr_add_sat(pagr_add_sat(va_diff, cyc_diff), ip_diff);
+	dist_clip = PAGR_CLIP(distance, pagr_bot_dist / 10,
+			      pagr_mul_sat(pagr_avg_dist, 10));
 	/*
 	 * Scale the threshold input by (1 - percent_fast^2), as in pact's
 	 * algorithm.c: when nearly all sampled accesses already hit the fast
