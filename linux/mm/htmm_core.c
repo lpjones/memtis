@@ -980,104 +980,116 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
 				unsigned long address)
 {
-    pte_t *pte, ptent;
-    spinlock_t *ptl;
-    pginfo_t *pginfo;
-    struct page *page, *pte_page;
-    int ret = 0;
+	pte_t *pte, ptent;
+	spinlock_t *ptl;
+	pginfo_t *pginfo;
+	struct page *page, *pte_page;
+	int nid;
 
-    pte = pte_offset_map_lock(vma->vm_mm, pmd, address, &ptl);
-    ptent = *pte;
-    if (!pte_present(ptent))
-	goto pte_unlock;
+	pte = pte_offset_map_lock(vma->vm_mm, pmd, address, &ptl);
+	ptent = *pte;
+	if (!pte_present(ptent))
+		goto pte_unlock;
 
-    page = vm_normal_page(vma, address, ptent);
-    if (!page || PageKsm(page))
-	goto pte_unlock;
+	page = vm_normal_page(vma, address, ptent);
+	if (!page || PageKsm(page))
+		goto pte_unlock;
 
-    if (page != compound_head(page))
-	goto pte_unlock;
+	if (page != compound_head(page))
+		goto pte_unlock;
 
-    pte_page = virt_to_page((unsigned long)pte);
-    if (!PageHtmm(pte_page))
-	goto pte_unlock;
+	pte_page = virt_to_page((unsigned long)pte);
+	if (!PageHtmm(pte_page))
+		goto pte_unlock;
 
-    pginfo = get_pginfo_from_pte(pte);
-    if (!pginfo)
-	goto pte_unlock;
+	pginfo = get_pginfo_from_pte(pte);
+	if (!pginfo)
+		goto pte_unlock;
 
-    update_base_page(vma, page, pginfo);
-    pte_unmap_unlock(pte, ptl);
-    if (htmm_cxl_mode) {
-	if (page_to_nid(page) == 0)
-	    return 1;
-	else
-	    return 2;
-    }
-    else {
-	if (node_is_toptier(page_to_nid(page)))
-	    return 1;
-	else
-	    return 2;
-    }
+	update_base_page(vma, page, pginfo);
+	nid = page_to_nid(page);
+	pte_unmap_unlock(pte, ptl);
+
+	if (htmm_cxl_mode)
+		return nid == 0 ? 1 : 2;
+	return node_is_toptier(nid) ? 1 : 2;
 
 pte_unlock:
-    pte_unmap_unlock(pte, ptl);
-    return ret;
+	pte_unmap_unlock(pte, ptl);
+	return 0;
 }
 
 static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 				unsigned long address)
 {
-    pmd_t *pmd, pmdval;
-    bool ret = 0;
-
-    pmd = pmd_offset(pud, address);
-    if (!pmd || pmd_none(*pmd))
-	return ret;
-    
-    if (is_swap_pmd(*pmd))
-	return ret;
-
-    if (!pmd_trans_huge(*pmd) && !pmd_devmap(*pmd) && unlikely(pmd_bad(*pmd))) {
-	pmd_clear_bad(pmd);
-	return ret;
-    }
-
-    pmdval = *pmd;
-    if (pmd_trans_huge(pmdval) || pmd_devmap(pmdval)) {
+	pmd_t *pmd, pmdval;
+	spinlock_t *ptl;
 	struct page *page;
+	int nid;
 
-	if (is_huge_zero_pmd(pmdval))
-	    return ret;
-	
-	page = pmd_page(pmdval);
-	if (!page)
-	    goto pmd_unlock;
-	
-	if (!PageCompound(page)) {
-	    goto pmd_unlock;
-	}
+	pmd = pmd_offset(pud, address);
+	if (!pmd)
+		return 0;
+
+	ptl = pmd_trans_huge_lock(pmd, vma);
+	if (!ptl)
+		goto base_page;
+
+	pmdval = *pmd;
+	if (unlikely(!pmd_present(pmdval)) ||
+	    !pmd_trans_huge(pmdval) || is_huge_zero_pmd(pmdval))
+		goto pmd_unlock;
+
+	page = compound_head(pmd_page(pmdval));
+	if (!PageCompound(page) || unlikely(!get_page_unless_zero(page)))
+		goto pmd_unlock;
+
+	spin_unlock(ptl);
+
+	/*
+	 * The PMD can be replaced as soon as its lock is dropped. Keep the
+	 * compound page alive and lock it before touching the HTMM metadata or
+	 * moving it on the LRU. The extra reference also makes concurrent THP
+	 * splitting and migration fail while the sample is being accounted.
+	 */
+	if (!trylock_page(page))
+		goto page_put;
+	if (!PageTransHuge(page))
+		goto page_unlock;
 
 	update_huge_page(vma, pmd, page, address);
-	if (htmm_cxl_mode) {
-	    if (page_to_nid(page) == 0)
-		return 1;
-	    else
-		return 2;
-	}
-	else {
-	    if (node_is_toptier(page_to_nid(page)))
-		return 1;
-	    else
-		return 2;
-	}
-pmd_unlock:
-	return 0;
-    }
+	nid = page_to_nid(page);
+	unlock_page(page);
+	put_page(page);
 
-    /* base page */
-    return __update_pte_pginfo(vma, pmd, address);
+	if (htmm_cxl_mode)
+		return nid == 0 ? 1 : 2;
+	return node_is_toptier(nid) ? 1 : 2;
+
+page_unlock:
+	unlock_page(page);
+page_put:
+	put_page(page);
+	return 0;
+
+pmd_unlock:
+	spin_unlock(ptl);
+	return 0;
+
+base_page:
+	if (pmd_none(*pmd) || is_swap_pmd(*pmd))
+		return 0;
+
+	if (!pmd_trans_huge(*pmd) && !pmd_devmap(*pmd) &&
+	    unlikely(pmd_bad(*pmd))) {
+		pmd_clear_bad(pmd);
+		return 0;
+	}
+
+	if (pmd_trans_unstable(pmd))
+		return 0;
+
+	return __update_pte_pginfo(vma, pmd, address);
 }
 
 static int __update_pginfo(struct vm_area_struct *vma, unsigned long address)
