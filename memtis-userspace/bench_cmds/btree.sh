@@ -4,6 +4,12 @@ BIN=/proj/TppPlus/tpp/workloads/vmitosis-workloads/bin
 
 # NELEMENTS = 200M (btree.c) => ~21GB resident on this testbed
 BENCH_RUN="${BIN}/bench_btree_mt"
+BENCH_DEPS=("${BIN}/bench_btree_mt")
+BENCH_CATEGORY="data-structure"
+BENCH_DESCRIPTION="Multithreaded B-tree with 350 million elements"
+BENCH_MEMORY_MIN_GB=32
+BENCH_MEMORY_MAX_GB=48
+BENCH_SLOW_MIN_GB=1
 BENCH_DRAM="max"
 BENCH_DRAM_BUFFER_MB="1024"
 

@@ -1,12 +1,15 @@
 #!/bin/bash
 
 BIN=/proj/TppPlus/tpp/workloads/gapbs
-# fixed copy: original twitter-2010.sg has a corrupted inverse-CSR section
-# (negative neighbor ids -> pr segfault); rebuilt from the valid out-CSR
-GRAPH_DIR=/mnt/pact_storage/workloads/gapbs
+GRAPH=/mnt/pact_storage/workloads/gapbs/kron28-degree12.sg
 
-# twitter-2010: ~9.7GB resident (both CSR directions touched)
-BENCH_RUN="${BIN}/bfs -f ${GRAPH_DIR}/twitter-2010-fixed.sg -n 256 -r 0"
+BENCH_RUN=("${BIN}/bfs" -f "${GRAPH}" -n 3 -r 0)
+BENCH_DEPS=("${BIN}/bfs" "${GRAPH}")
+BENCH_CATEGORY="graph"
+BENCH_DESCRIPTION="GAP Benchmark Suite BFS on a scale-28 Kronecker graph"
+BENCH_MEMORY_MIN_GB=32
+BENCH_MEMORY_MAX_GB=48
+BENCH_SLOW_MIN_GB=1
 BENCH_DRAM="max"
 BENCH_DRAM_BUFFER_MB="1024"
 
