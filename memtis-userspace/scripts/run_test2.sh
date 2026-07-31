@@ -2,7 +2,7 @@
 # py_bin="/proj/TppPlus/tpp/scripts/venv/bin/python"
 
 trials=3
-node=5
+node=1.02
 
 function bench_run() {
     local prefix=$1; shift
@@ -17,10 +17,10 @@ function bench_run() {
     done
 }
 
-# bench_run "og" "cgups" $trials $node
-# bench_run "og" "resnet" $trials $node
-# bench_run "og" "stream" $trials $node
-# bench_run "og" "xsbench" $trials $node
+bench_run "og" "cgups" $trials $node
+bench_run "og" "resnet" $trials $node
+bench_run "og" "stream" $trials $node
+bench_run "og" "xsbench" $trials $node
 bench_run "og" "graph500" $trials $node
 bench_run "og" "pagerank" $trials $node
 bench_run "og" "silo" $trials $node

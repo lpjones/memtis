@@ -2841,11 +2841,11 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 				spin_lock(&memcg->access_lock);
 				idx = head[3].idx;
 
-				if (idx < 16) {
+				if (idx < ARRAY_SIZE(memcg->hotness_hg)) {
 					if (memcg->hotness_hg[idx] < HPAGE_PMD_NR)
-					memcg->hotness_hg[idx] = 0;
+						memcg->hotness_hg[idx] = 0;
 					else
-					memcg->hotness_hg[idx] -= HPAGE_PMD_NR;
+						memcg->hotness_hg[idx] -= HPAGE_PMD_NR;
 				}
 
 				spin_unlock(&memcg->access_lock);

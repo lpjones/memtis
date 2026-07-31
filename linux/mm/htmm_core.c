@@ -427,23 +427,25 @@ int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *mm)
 struct deferred_split *get_deferred_split_queue_for_htmm(struct page *page)
 {
     struct mem_cgroup *memcg = page_memcg(compound_head(page));
-    struct mem_cgroup_per_node *pn = memcg->nodeinfo[page_to_nid(page)];
+    struct mem_cgroup_per_node *pn;
 
     if (!memcg || !memcg->htmm_enabled)
-	return NULL;
-    else
-	return &pn->deferred_split_queue;
+		return NULL;
+
+	pn = memcg->nodeinfo[page_to_nid(page)];
+	return pn ? &pn->deferred_split_queue : NULL;
 }
 
 struct list_head *get_deferred_list(struct page *page)
 {
     struct mem_cgroup *memcg = page_memcg(compound_head(page));
-    struct mem_cgroup_per_node *pn = memcg->nodeinfo[page_to_nid(page)];
+    struct mem_cgroup_per_node *pn;
 
     if (!memcg || !memcg->htmm_enabled)
-	return NULL;
-    else
-	return &pn->deferred_list; 
+		return NULL;
+
+	pn = memcg->nodeinfo[page_to_nid(page)];
+	return pn ? &pn->deferred_list : NULL;
 }
 
 bool deferred_split_huge_page_for_htmm(struct page *page)
@@ -499,97 +501,106 @@ void check_failed_list(struct mem_cgroup_per_node *pn,
 	idx = meta->idx;
 
 	spin_lock(&memcg->access_lock);
-	memcg->hotness_hg[idx] += HPAGE_PMD_NR;
+	if (idx < ARRAY_SIZE(memcg->hotness_hg))
+		memcg->hotness_hg[idx] += HPAGE_PMD_NR;
 	spin_unlock(&memcg->access_lock);
     }
 }
 
 unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
-	struct list_head *split_list)
+	struct list_head *split_list, unsigned long *nr_isolated)
 {
     struct deferred_split *ds_queue = &pn->deferred_split_queue;
-    //struct list_head *deferred_list = &pn->deferred_list;
     unsigned long flags;
     LIST_HEAD(list), *pos, *next;
     LIST_HEAD(failed_list);
     struct page *page;
     unsigned int nr_max = 50; // max: 100MB
-    int split = 0;
+    unsigned int nr_scanned = 0;
+	int split = 0;
+
+	*nr_isolated = 0;
 
     spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
-    list_for_each_safe(pos, next, &ds_queue->split_queue) {
-	page = list_entry((void *)pos, struct page, deferred_list);
-	page = compound_head(page);
-    
-	if (page_count(page) < 1) {
-	    list_del_init(page_deferred_list(page));
-	    ds_queue->split_queue_len--;
-	}
-	else { 
-	    list_move(page_deferred_list(page), &list);
-	}
+    /* Pin each head while it is detached from the protected queue. */
+	list_for_each_safe(pos, next, &ds_queue->split_queue) {
+		page = list_entry((void *)pos, struct page, deferred_list);
+		page = compound_head(page);
+		
+		if (!get_page_unless_zero(page)) {
+			/* We lost the race with free_transhuge_page() */
+			list_del_init(page_deferred_list(page));
+			ds_queue->split_queue_len--;
+		} else { 
+			list_move(page_deferred_list(page), &list);
+			if (++nr_scanned == nr_max)
+				break;
+		}
     }
     spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
 
     list_for_each_safe(pos, next, &list) {
-	LIST_HEAD(tmp);
-	struct lruvec *lruvec;
+		LIST_HEAD(tmp);
+		struct lruvec *lruvec;
 
-	if (split >= nr_max)
-	    break;
+		page = list_entry((void *)pos, struct page, deferred_list);
+		page = compound_head(page);
 
-	page = list_entry((void *)pos, struct page, deferred_list);
-	page = compound_head(page);
+		if (!trylock_page(page))
+			goto put_page;
+		if (!PageTransHuge(page) || !PageAnon(page) || !PageLRU(page))
+			goto unlock_page;
 
-	if (!PageLRU(page)) {
-	    continue;
-	}
+		lruvec = mem_cgroup_page_lruvec(page);
+		if (lruvec != &pn->lruvec)
+			goto unlock_page;
+		
+		/*
+		* The queue pin keeps the page stable while the LRU isolation
+		* reference is acquired. The latter is consumed when the split
+		* pages are eventually returned to the LRU.
+		*/
+		spin_lock_irq(&lruvec->lru_lock);
+		if (!__isolate_lru_page_prepare(page, 0)) {
+			spin_unlock_irq(&lruvec->lru_lock);
+			goto unlock_page;
+		}
 
-	lruvec = mem_cgroup_page_lruvec(page);
-	if (lruvec != &pn->lruvec) {
-	    continue;
-	}
+		get_page(page);
 
-	spin_lock_irq(&lruvec->lru_lock);
-	if (!__isolate_lru_page_prepare(page, 0)) {
-	    spin_unlock_irq(&lruvec->lru_lock);
-	    continue;
-	}
+		if (!TestClearPageLRU(page)) {
+			put_page(page);
+			spin_unlock_irq(&lruvec->lru_lock); 
+			goto unlock_page;
+		}
+		
+		list_move(&page->lru, &tmp);
+		update_lru_size(lruvec, page_lru(page), page_zonenum(page),
+				-thp_nr_pages(page));
+		__mod_node_page_state(lruvec_pgdat(lruvec), NR_ISOLATED_ANON,
+					thp_nr_pages(page));
+		*nr_isolated += thp_nr_pages(page);
+		spin_unlock_irq(&lruvec->lru_lock);
 
-	if (unlikely(!get_page_unless_zero(page))) {
-	    spin_unlock_irq(&lruvec->lru_lock);
-	    continue;
-	}
+		/* The isolation reference now provides the lifetime guarantee. */
+		put_page(page);
 
-	if (!TestClearPageLRU(page)) {
-	    put_page(page);
-	    spin_unlock_irq(&lruvec->lru_lock); 
-	    continue;
-	}
-    
-	list_move(&page->lru, &tmp);
-	update_lru_size(lruvec, page_lru(page), page_zonenum(page),
-		    -thp_nr_pages(page));
-	__mod_node_page_state(page_pgdat(page),
-			NR_ISOLATED_ANON + page_is_file_lru(page),
-			thp_nr_pages(page));
-	spin_unlock_irq(&lruvec->lru_lock);
+		if (!split_huge_page_to_list(page, &tmp)) {
+			split++;
+			list_splice(&tmp, split_list);
+		} else {
+			check_failed_list(pn, &tmp, &failed_list);
+		}
 
-	if (!trylock_page(page)) {
-	    list_splice_tail(&tmp, split_list);
-	    continue;
-	}
+		unlock_page(page);
+		continue;
 
-	if (!split_huge_page_to_list(page, &tmp)) {
-	    split++;
-	    list_splice(&tmp, split_list);
-	} else {
-	    check_failed_list(pn, &tmp, &failed_list);
-	}
-
-	unlock_page(page);
+unlock_page:
+		unlock_page(page);
+put_page:
+		put_page(page);
     }
-    putback_movable_pages(&failed_list);
+    list_splice(&failed_list, split_list);
 
     /* handle list and failed_list */
     spin_lock_irqsave(&ds_queue->split_queue_lock, flags); 
@@ -601,38 +612,37 @@ unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
     return split;
 }
 
-void putback_split_pages(struct list_head *split_list, struct lruvec *lruvec)
+void putback_split_pages(struct list_head *split_list, struct lruvec *lruvec,
+	unsigned long nr_isolated)
 {
     LIST_HEAD(l_active);
     LIST_HEAD(l_inactive);
 
     while (!list_empty(split_list)) {
-	struct page *page;
+		struct page *page;
 
-	page = lru_to_page(split_list);
-	list_del(&page->lru);
+		page = lru_to_page(split_list);
+		list_del(&page->lru);
 
-	__mod_node_page_state(page_pgdat(page),
-			NR_ISOLATED_ANON + page_is_file_lru(page),
-			-thp_nr_pages(page));
+		if (unlikely(!page_evictable(page))) {
+			putback_lru_page(page);
+			continue;
+		}
 
-	if (unlikely(!page_evictable(page))) {
-	    putback_lru_page(page);
-	    continue;
-	}
+		VM_WARN_ON(PageLRU(page));
 
-	VM_WARN_ON(PageLRU(page));
-
-	if (PageActive(page))
-	    list_add(&page->lru, &l_active);
-	else
-	    list_add(&page->lru, &l_inactive);
+		if (PageActive(page))
+			list_add(&page->lru, &l_active);
+		else
+			list_add(&page->lru, &l_inactive);
     }
 
     spin_lock_irq(&lruvec->lru_lock);
     move_pages_to_lru(lruvec, &l_active);
     move_pages_to_lru(lruvec, &l_inactive);
     list_splice(&l_inactive, &l_active);
+	__mod_node_page_state(lruvec_pgdat(lruvec), NR_ISOLATED_ANON,
+			  -(long)nr_isolated);
     spin_unlock_irq(&lruvec->lru_lock);
 
     mem_cgroup_uncharge_list(&l_active);

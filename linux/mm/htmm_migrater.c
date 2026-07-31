@@ -39,40 +39,32 @@
 
 void add_memcg_to_kmigraterd(struct mem_cgroup *memcg, int nid)
 {
-    struct mem_cgroup_per_node *mz, *pn = memcg->nodeinfo[nid];
+    struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
     pg_data_t *pgdat = NODE_DATA(nid);
 
-    if (!pgdat)
-	return;
+    if (!pgdat || !pn)
+		return;
     
     if (pn->memcg != memcg)
-	printk("memcg mismatch!\n");
+		printk("memcg mismatch!\n");
 
     spin_lock(&pgdat->kmigraterd_lock);
-    list_for_each_entry(mz, &pgdat->kmigraterd_head, kmigraterd_list) {
-	if (mz == pn)
-	    goto add_unlock;
-    }
-    list_add_tail(&pn->kmigraterd_list, &pgdat->kmigraterd_head);
-add_unlock:
+    if (list_empty(&pn->kmigraterd_list))
+		list_add_tail(&pn->kmigraterd_list, &pgdat->kmigraterd_head);
     spin_unlock(&pgdat->kmigraterd_lock);
 }
 
 void del_memcg_from_kmigraterd(struct mem_cgroup *memcg, int nid)
 {
-    struct mem_cgroup_per_node *mz, *pn = memcg->nodeinfo[nid];
+    struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
     pg_data_t *pgdat = NODE_DATA(nid);
     
-    if (!pgdat)
-	return;
+    if (!pgdat || !pn)
+		return;
 
     spin_lock(&pgdat->kmigraterd_lock);
-    list_for_each_entry(mz, &pgdat->kmigraterd_head, kmigraterd_list) {
-	if (mz == pn) {
-	    list_del(&pn->kmigraterd_list);
-	    break;
-	}
-    }
+    if (!list_empty(&pn->kmigraterd_list))
+		list_del_init(&pn->kmigraterd_list);
     spin_unlock(&pgdat->kmigraterd_lock);
 }
 
@@ -932,15 +924,22 @@ static void adjusting_node(pg_data_t *pgdat, struct mem_cgroup *memcg, bool acti
 
 static struct mem_cgroup_per_node *next_memcg_cand(pg_data_t *pgdat)
 {
-    struct mem_cgroup_per_node *pn;
+    struct mem_cgroup_per_node *pn = NULL;
 
     spin_lock(&pgdat->kmigraterd_lock);
-    if (!list_empty(&pgdat->kmigraterd_head)) {
-	pn = list_first_entry(&pgdat->kmigraterd_head, typeof(*pn), kmigraterd_list);
-	list_move_tail(&pn->kmigraterd_list, &pgdat->kmigraterd_head);
+    while (!list_empty(&pgdat->kmigraterd_head)) {
+		pn = list_first_entry(&pgdat->kmigraterd_head, typeof(*pn),
+					kmigraterd_list);
+		if (pn->memcg && css_tryget_online(&pn->memcg->css)) {
+			list_move_tail(&pn->kmigraterd_list,
+				&pgdat->kmigraterd_head);
+			break;
+		}
+
+		/* The cgroup is being destroyed; do not leave a stale node. */
+		list_del_init(&pn->kmigraterd_list);
+		pn = NULL;
     }
-    else
-	pn = NULL;
     spin_unlock(&pgdat->kmigraterd_lock);
 
     return pn;
@@ -954,58 +953,61 @@ static int kmigraterd_demotion(pg_data_t *pgdat)
 	set_cpus_allowed_ptr(pgdat->kmigraterd, cpumask);
 
     for ( ; ; ) {
-	struct mem_cgroup_per_node *pn;
-	struct mem_cgroup *memcg;
-	unsigned long nr_exceeded = 0;
-	LIST_HEAD(split_list);
+		struct mem_cgroup_per_node *pn;
+		struct mem_cgroup *memcg;
+		unsigned long nr_exceeded = 0;
+		unsigned long nr_isolated = 0;
+		LIST_HEAD(split_list);
 
-	if (kthread_should_stop())
-	    break;
+		if (kthread_should_stop())
+			break;
 
-	pn = next_memcg_cand(pgdat);
-	if (!pn) {
-	    msleep_interruptible(1000);
-	    continue;
-	}
+		pn = next_memcg_cand(pgdat);
+		if (!pn) {
+			msleep_interruptible(1000);
+			continue;
+		}
 
-	memcg = pn->memcg;
-	if (!memcg || !memcg->htmm_enabled) {
-	    spin_lock(&pgdat->kmigraterd_lock);
-	    if (!list_empty_careful(&pn->kmigraterd_list))
-		list_del(&pn->kmigraterd_list);
-	    spin_unlock(&pgdat->kmigraterd_lock);
-	    continue;
-	}
+		memcg = pn->memcg;
+		if (!READ_ONCE(memcg->htmm_enabled)) {
+			spin_lock(&pgdat->kmigraterd_lock);
+			if (!list_empty(&pn->kmigraterd_list))
+				list_del_init(&pn->kmigraterd_list);
+			spin_unlock(&pgdat->kmigraterd_lock);
+			css_put(&memcg->css);
+			continue;
+		}
 
-	/* performs split */
-	if (!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
-	    unsigned long nr_split;
-	    nr_split = deferred_split_scan_for_htmm(pn, &split_list);
-	    if (!list_empty(&split_list)) {
-		putback_split_pages(&split_list, mem_cgroup_lruvec(memcg, pgdat));
-	    }
-	}
-	/* performs cooling */
-	if (need_lru_cooling(pn))
-	    cooling_node(pgdat, memcg);
-	else if (need_lru_adjusting(pn)) {
-	    adjusting_node(pgdat, memcg, true);
-	    if (pn->need_adjusting_all == true)
-		// adjusting the inactive list
-		adjusting_node(pgdat, memcg, false);
-	}
-	
-	/* demotes inactive lru pages */
-	if (need_toptier_demotion(pgdat, memcg, &nr_exceeded)) {
-	    demote_node(pgdat, memcg, nr_exceeded);
-	}
-	//if (need_direct_demotion(pgdat, memcg))
-	  //  goto demotion;
+		/* performs split */
+		if (!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
+			deferred_split_scan_for_htmm(pn, &split_list, &nr_isolated);
+			if (nr_isolated)
+				putback_split_pages(&split_list,
+							mem_cgroup_lruvec(memcg, pgdat),
+							nr_isolated);
+		}
+		/* performs cooling */
+		if (need_lru_cooling(pn))
+			cooling_node(pgdat, memcg);
+		else if (need_lru_adjusting(pn)) {
+			adjusting_node(pgdat, memcg, true);
+			if (pn->need_adjusting_all == true)
+			// adjusting the inactive list
+			adjusting_node(pgdat, memcg, false);
+		}
+		
+		/* demotes inactive lru pages */
+		if (need_toptier_demotion(pgdat, memcg, &nr_exceeded)) {
+			demote_node(pgdat, memcg, nr_exceeded);
+		}
+		//if (need_direct_demotion(pgdat, memcg))
+		//  goto demotion;
 
-	/* default: wait 50 ms */
-	wait_event_interruptible_timeout(pgdat->kmigraterd_wait,
-	    need_direct_demotion(pgdat, memcg),
-	    msecs_to_jiffies(htmm_demotion_period_in_ms));	    
+		/* default: wait 50 ms */
+		wait_event_interruptible_timeout(pgdat->kmigraterd_wait,
+			need_direct_demotion(pgdat, memcg),
+			msecs_to_jiffies(htmm_demotion_period_in_ms));
+		css_put(&memcg->css);    
     }
     return 0;
 }
@@ -1017,58 +1019,61 @@ static int kmigraterd_promotion(pg_data_t *pgdat)
     if (htmm_cxl_mode)
     	cpumask = cpumask_of_node(pgdat->node_id);
     else
-	cpumask = cpumask_of_node(pgdat->node_id - 2);
+		cpumask = cpumask_of_node(pgdat->node_id - 2);
 
     if (!cpumask_empty(cpumask))
-	set_cpus_allowed_ptr(pgdat->kmigraterd, cpumask);
+		set_cpus_allowed_ptr(pgdat->kmigraterd, cpumask);
 
     for ( ; ; ) {
-	struct mem_cgroup_per_node *pn;
-	struct mem_cgroup *memcg;
-	LIST_HEAD(split_list);
+		struct mem_cgroup_per_node *pn;
+		struct mem_cgroup *memcg;
+		unsigned long nr_isolated = 0;
+		LIST_HEAD(split_list);
 
-	if (kthread_should_stop())
-	    break;
+		if (kthread_should_stop())
+			break;
 
-	pn = next_memcg_cand(pgdat);
-	if (!pn) {
-	    msleep_interruptible(1000);
-	    continue;
-	}
+		pn = next_memcg_cand(pgdat);
+		if (!pn) {
+			msleep_interruptible(1000);
+			continue;
+		}
 
-	memcg = pn->memcg;
-	if (!memcg || !memcg->htmm_enabled) {
-	    spin_lock(&pgdat->kmigraterd_lock);
-	    if (!list_empty_careful(&pn->kmigraterd_list))
-		list_del(&pn->kmigraterd_list);
-	    spin_unlock(&pgdat->kmigraterd_lock);
-	    continue;
-	}
+		memcg = pn->memcg;
+		if (!READ_ONCE(memcg->htmm_enabled)) {
+			spin_lock(&pgdat->kmigraterd_lock);
+			if (!list_empty(&pn->kmigraterd_list))
+				list_del_init(&pn->kmigraterd_list);
+			spin_unlock(&pgdat->kmigraterd_lock);
+			css_put(&memcg->css);
+			continue;
+		}
 
-	/* performs split */
-	if (!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
-	    unsigned long nr_split;
-	    nr_split = deferred_split_scan_for_htmm(pn, &split_list);
-	    if (!list_empty(&split_list)) {
-		putback_split_pages(&split_list, mem_cgroup_lruvec(memcg, pgdat));
-	    }
-	}
+		/* performs split */
+		if (!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
+			deferred_split_scan_for_htmm(pn, &split_list, &nr_isolated);
+			if (nr_isolated)
+				putback_split_pages(&split_list,
+							mem_cgroup_lruvec(memcg, pgdat),
+							nr_isolated);
+		}
 
-	if (need_lru_cooling(pn))
-	    cooling_node(pgdat, memcg);
-	else if (need_lru_adjusting(pn)) {
-	    adjusting_node(pgdat, memcg, true);
-	    if (pn->need_adjusting_all == true)
-		// adjusting the inactive list
-		adjusting_node(pgdat, memcg, false);
-	}
+		if (need_lru_cooling(pn))
+			cooling_node(pgdat, memcg);
+		else if (need_lru_adjusting(pn)) {
+			adjusting_node(pgdat, memcg, true);
+			if (pn->need_adjusting_all == true)
+			// adjusting the inactive list
+			adjusting_node(pgdat, memcg, false);
+		}
 
-	/* promotes hot pages to fast memory node */
-	if (need_lowertier_promotion(pgdat, memcg)) {
-	    promote_node(pgdat, memcg);
-	}
+		/* promotes hot pages to fast memory node */
+		if (need_lowertier_promotion(pgdat, memcg)) {
+			promote_node(pgdat, memcg);
+		}
 
-	msleep_interruptible(htmm_promotion_period_in_ms);
+		css_put(&memcg->css);
+		msleep_interruptible(htmm_promotion_period_in_ms);
     }
 
     return 0;

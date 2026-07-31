@@ -118,7 +118,9 @@ extern void htmm_pred_log_stop(void);
 extern bool deferred_split_huge_page_for_htmm(struct page *page);
 extern unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
 						  struct list_head *split_list);
-extern void putback_split_pages(struct list_head *split_list, struct lruvec *lruvec);
+extern void putback_split_pages(struct list_head *split_list, 
+                struct lruvec *lruvec,
+                unsigned long nr_isolated);
 
 extern bool check_split_huge_page(struct mem_cgroup *memcg, struct page *meta, bool hot);
 extern bool move_page_to_deferred_split_queue(struct mem_cgroup *memcg, struct page *page);
