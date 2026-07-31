@@ -22,42 +22,33 @@
 #define PAGR_DEC_MIG_NUM 10000ULL
 #define PAGR_NEIGHBOR_DEC_NUM 1100ULL
 #define PAGR_NEIGHBOR_DEC_DEN 1000ULL
-#define PAGR_INVALID_ENTRY (~0U)
 
 #define PAGR_ABS_DIFF(a, b) ((a) > (b) ? (a) - (b) : (b) - (a))
 #define PAGR_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define PAGR_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define PAGR_CLIP(x, a, b) (PAGR_MIN(PAGR_MAX((x), (a)), (b)))
 
-struct pagr_neighbor {
-	unsigned int idx;
-	u64 distance;
-	u64 time_diff;
-};
-
-struct pagr_entry {
+struct pagr_sample {
 	struct page *page;
 	unsigned long va;
 	unsigned long cyc;
 	unsigned long ip;
-	unsigned long stamp;
-	bool predicted;
-	struct pagr_neighbor neighbors[PAGR_MAX_NEIGHBORS];
+	unsigned long generation;
 };
 
 struct pagr_queue_entry {
-	unsigned int idx;
-	unsigned long stamp;
+	struct page *page;
+	unsigned long generation;
 	int src_nid;
 	int target_nid;
 	u64 enqueue_cyc;
 };
 
-static struct pagr_entry pagr_entries[PAGR_ENTRY_TABLE_SIZE];
-static unsigned int pagr_history[PAGR_HISTORY_SIZE];
+/* Only recent samples are global; every graph node and edge lives in its THP. */
+static struct pagr_sample pagr_history[PAGR_HISTORY_SIZE];
 static unsigned int pagr_history_count;
 static DEFINE_SPINLOCK(pagr_lock);
-static unsigned long pagr_next_stamp;
+static unsigned long pagr_next_generation;
 
 static u64 top_va = 2 * PAGR_SCALE, bot_va = 1 * PAGR_SCALE;
 static u64 top_cyc = 2 * PAGR_SCALE, bot_cyc = 1 * PAGR_SCALE;
@@ -151,16 +142,14 @@ static u64 pagr_percent_fast_factor(void)
 enum pagr_stat_idx {
 	PAGR_STAT_ADD_CALLS,
 	PAGR_STAT_ADD_NON_THP,
-	PAGR_STAT_ADD_ALLOC_FAIL,
 	PAGR_STAT_ENTRY_NEW,
 	PAGR_STAT_ENTRY_EXISTING,
-	PAGR_STAT_ENTRY_EVICTED,
 	PAGR_STAT_HISTORY_RECORDED,
 	PAGR_STAT_HISTORY_WRAPPED,
 	PAGR_STAT_NEIGHBOR_UPDATES,
 	PAGR_STAT_NEIGHBOR_CANDIDATES,
 	PAGR_STAT_PRED_CALLS,
-	PAGR_STAT_PRED_NO_ENTRY,
+	PAGR_STAT_PRED_NO_METADATA,
 	PAGR_STAT_PRED_SKIP_EMPTY,
 	PAGR_STAT_PRED_SKIP_DISTANCE,
 	PAGR_STAT_PRED_SKIP_STALE,
@@ -174,7 +163,7 @@ enum pagr_stat_idx {
 	PAGR_STAT_QUEUE_ATTEMPTS,
 	PAGR_STAT_QUEUE_NON_THP,
 	PAGR_STAT_QUEUE_NOT_PROMOTABLE,
-	PAGR_STAT_QUEUE_MISSING_HISTORY,
+	PAGR_STAT_QUEUE_MISSING_METADATA,
 	PAGR_STAT_QUEUE_DUPLICATE,
 	PAGR_STAT_QUEUE_FULL,
 	PAGR_STAT_QUEUE_ACCEPTED,
@@ -236,29 +225,11 @@ static unsigned int queue_count_snapshot(void)
 
 void pagr_debug_dump(const char *where)
 {
-	unsigned int active_entries = 0, predicted_entries = 0;
 	unsigned int history_count = READ_ONCE(pagr_history_count);
 	unsigned int queue_count = queue_count_snapshot();
-	unsigned long flags;
-	bool have_entry_snapshot = false;
-	int i;
 
-	if (spin_trylock_irqsave(&pagr_lock, flags)) {
-		for (i = 0; i < PAGR_ENTRY_TABLE_SIZE; i++) {
-			if (!pagr_entries[i].page)
-				continue;
-			active_entries++;
-			if (pagr_entries[i].predicted)
-				predicted_entries++;
-		}
-		have_entry_snapshot = true;
-		spin_unlock_irqrestore(&pagr_lock, flags);
-	}
-
-	pr_info("PAGR_DBG[%s] state entries=%u predicted_entries=%u entry_snapshot=%u history=%u queue=%u threshold=%llu avg_dist=%llu fast_factor=%llu va_top=%llu va_bot=%llu cyc_top=%llu cyc_bot=%llu ip_top=%llu ip_bot=%llu mig_queue=%llu mig_move=%llu max_pred=%u graph_interval=%u\n",
-		where, active_entries, predicted_entries,
-		have_entry_snapshot ? 1U : 0U, history_count, queue_count,
-		READ_ONCE(pagr_bot_dist),
+	pr_info("PAGR_DBG[%s] state metadata=per_thp history=%u queue=%u threshold=%llu avg_dist=%llu fast_factor=%llu va_top=%llu va_bot=%llu cyc_top=%llu cyc_bot=%llu ip_top=%llu ip_bot=%llu mig_queue=%llu mig_move=%llu max_pred=%u graph_interval=%u\n",
+		where, history_count, queue_count, READ_ONCE(pagr_bot_dist),
 		READ_ONCE(pagr_avg_dist), pagr_percent_fast_factor(),
 		READ_ONCE(top_va), READ_ONCE(bot_va),
 		READ_ONCE(top_cyc), READ_ONCE(bot_cyc), READ_ONCE(top_ip),
@@ -267,21 +238,19 @@ void pagr_debug_dump(const char *where)
 		READ_ONCE(pagr_max_predictions_per_sample),
 		READ_ONCE(pagr_graph_sample_interval));
 
-	pr_info("PAGR_DBG[%s] add add=%lld non_thp=%lld alloc_fail=%lld new=%lld existing=%lld evicted=%lld hist=%lld hist_wrap=%lld neighbor_updates=%lld neighbor_candidates=%lld\n",
+	pr_info("PAGR_DBG[%s] add add=%lld non_thp=%lld new_nodes=%lld existing_nodes=%lld hist=%lld hist_wrap=%lld neighbor_updates=%lld neighbor_candidates=%lld\n",
 		where, pagr_stat_read(PAGR_STAT_ADD_CALLS),
 		pagr_stat_read(PAGR_STAT_ADD_NON_THP),
-		pagr_stat_read(PAGR_STAT_ADD_ALLOC_FAIL),
 		pagr_stat_read(PAGR_STAT_ENTRY_NEW),
 		pagr_stat_read(PAGR_STAT_ENTRY_EXISTING),
-		pagr_stat_read(PAGR_STAT_ENTRY_EVICTED),
 		pagr_stat_read(PAGR_STAT_HISTORY_RECORDED),
 		pagr_stat_read(PAGR_STAT_HISTORY_WRAPPED),
 		pagr_stat_read(PAGR_STAT_NEIGHBOR_UPDATES),
 		pagr_stat_read(PAGR_STAT_NEIGHBOR_CANDIDATES));
 
-	pr_info("PAGR_DBG[%s] pred calls=%lld no_entry=%lld selected=%lld cap_hit=%lld zero=%lld skip_empty=%lld skip_dist=%lld skip_stale=%lld skip_time=%lld skip_dup=%lld skip_already_pred=%lld skip_not_promotable=%lld\n",
+	pr_info("PAGR_DBG[%s] pred calls=%lld no_metadata=%lld selected=%lld cap_hit=%lld zero=%lld skip_empty=%lld skip_dist=%lld skip_stale=%lld skip_time=%lld skip_dup=%lld skip_already_pred=%lld skip_not_promotable=%lld\n",
 		where, pagr_stat_read(PAGR_STAT_PRED_CALLS),
-		pagr_stat_read(PAGR_STAT_PRED_NO_ENTRY),
+		pagr_stat_read(PAGR_STAT_PRED_NO_METADATA),
 		pagr_stat_read(PAGR_STAT_PRED_SELECTED),
 		pagr_stat_read(PAGR_STAT_PRED_CAP_HIT),
 		pagr_stat_read(PAGR_STAT_PRED_ZERO),
@@ -293,12 +262,12 @@ void pagr_debug_dump(const char *where)
 		pagr_stat_read(PAGR_STAT_PRED_SKIP_ALREADY_PRED),
 		pagr_stat_read(PAGR_STAT_PRED_SKIP_NOT_PROMOTABLE));
 
-	pr_info("PAGR_DBG[%s] queue attempts=%lld accepted=%lld drops_non_thp=%lld drops_not_promotable=%lld drops_missing_history=%lld drops_duplicate=%lld drops_full=%lld dequeue_empty=%lld dequeue_requeued=%lld process_calls=%lld process_stale=%lld process_mig_entries=%lld process_mig_base=%lld process_mig_failed=%lld\n",
+	pr_info("PAGR_DBG[%s] queue attempts=%lld accepted=%lld drops_non_thp=%lld drops_not_promotable=%lld drops_missing_metadata=%lld drops_duplicate=%lld drops_full=%lld dequeue_empty=%lld dequeue_requeued=%lld process_calls=%lld process_stale=%lld process_mig_entries=%lld process_mig_base=%lld process_mig_failed=%lld\n",
 		where, pagr_stat_read(PAGR_STAT_QUEUE_ATTEMPTS),
 		pagr_stat_read(PAGR_STAT_QUEUE_ACCEPTED),
 		pagr_stat_read(PAGR_STAT_QUEUE_NON_THP),
 		pagr_stat_read(PAGR_STAT_QUEUE_NOT_PROMOTABLE),
-		pagr_stat_read(PAGR_STAT_QUEUE_MISSING_HISTORY),
+		pagr_stat_read(PAGR_STAT_QUEUE_MISSING_METADATA),
 		pagr_stat_read(PAGR_STAT_QUEUE_DUPLICATE),
 		pagr_stat_read(PAGR_STAT_QUEUE_FULL),
 		pagr_stat_read(PAGR_STAT_DEQUEUE_EMPTY),
@@ -407,71 +376,107 @@ void pagr_debug_note_lru_migration(int promotion, unsigned long nr_pages)
 	pagr_debug_maybe_dump(promotion ? "lru_promote" : "lru_demote");
 }
 
-static void clear_entry_neighbors(struct pagr_entry *entry)
+static inline pginfo_t *pagr_neighbor_info(struct page *page,
+					 unsigned int slot)
 {
-	int i;
-
-	for (i = 0; i < PAGR_MAX_NEIGHBORS; i++) {
-		entry->neighbors[i].idx = PAGR_INVALID_ENTRY;
-		entry->neighbors[i].distance = 0;
-		entry->neighbors[i].time_diff = 0;
-	}
+	return &page[PAGR_NEIGHBOR_PAGE_OFFSET + slot].pagr_info;
 }
 
-static void clear_neighbor_refs(unsigned int old_idx)
+static inline pginfo_t *pagr_state_info(struct page *page)
 {
-	int i, j;
-
-	for (i = 0; i < PAGR_ENTRY_TABLE_SIZE; i++) {
-		struct pagr_entry *entry = &pagr_entries[i];
-
-		if (!entry->page)
-			continue;
-
-		for (j = 0; j < PAGR_MAX_NEIGHBORS; j++) {
-			if (entry->neighbors[j].idx == old_idx) {
-				entry->neighbors[j].idx = PAGR_INVALID_ENTRY;
-				entry->neighbors[j].distance = 0;
-				entry->neighbors[j].time_diff = 0;
-			}
-		}
-	}
+	return &page[PAGR_STATE_PAGE_OFFSET].pagr_info;
 }
 
-static void clear_history_refs(unsigned int old_idx)
+static void clear_page_neighbors(struct page *page)
 {
-	int i;
+	pginfo_t zero = { 0 };
+	unsigned int i;
 
-	for (i = 0; i < pagr_history_count; i++) {
-		if (pagr_history[i] != old_idx)
-			continue;
-
-		pagr_history[i] = pagr_history[pagr_history_count - 1];
-		pagr_history_count--;
-		i--;
-	}
+	for (i = 0; i < PAGR_MAX_NEIGHBORS; i++)
+		*pagr_neighbor_info(page, i) = zero;
 }
 
-static int find_entry(struct page *page)
+static unsigned long new_page_generation(void)
 {
+	if (++pagr_next_generation == 0)
+		pagr_next_generation = 1;
+
+	return pagr_next_generation;
+}
+
+static bool pagr_page_generation(struct page *page,
+				 unsigned long *generation)
+{
+	unsigned long current_generation;
+
+	if (!page || !PageTransHuge(page))
+		return false;
+	if (!test_bit(PAGR_PAGE_TRACKED,
+		      &page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags))
+		return false;
+
+	current_generation = READ_ONCE(pagr_state_info(page)->generation);
+	if (!current_generation)
+		return false;
+
+	if (generation)
+		*generation = current_generation;
+	return true;
+}
+
+static bool pagr_page_is_current(struct page *page, unsigned long generation)
+{
+	unsigned long current_generation;
+
+	return generation && pagr_page_generation(page, &current_generation) &&
+	       current_generation == generation;
+}
+
+void pagr_migrate_page_metadata(struct page *page, struct page *newpage)
+{
+	pginfo_t zero = { 0 };
+	unsigned long flags;
 	int i;
 
 	page = compound_head(page);
+	newpage = compound_head(newpage);
 
-	for (i = 0; i < PAGR_ENTRY_TABLE_SIZE; i++) {
-		if (pagr_entries[i].page == page)
-			return i;
+	spin_lock_irqsave(&pagr_lock, flags);
+
+	newpage[PAGR_SAMPLE_PAGE_OFFSET].last_va =
+		page[PAGR_SAMPLE_PAGE_OFFSET].last_va;
+	newpage[PAGR_SAMPLE_PAGE_OFFSET].last_cyc =
+		page[PAGR_SAMPLE_PAGE_OFFSET].last_cyc;
+	newpage[PAGR_SAMPLE_PAGE_OFFSET].last_ip =
+		page[PAGR_SAMPLE_PAGE_OFFSET].last_ip;
+	newpage[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags = 0;
+	clear_page_neighbors(newpage);
+	*pagr_state_info(newpage) = zero;
+
+	/*
+	 * A migration changes the struct page pointer that identifies the node.
+	 * Invalidate the old generation under the graph lock. Incoming edges and
+	 * queued predictions will then fail their generation check instead of
+	 * following a pointer to recycled page metadata.
+	 */
+	for (i = 0; i < pagr_history_count; i++) {
+		if (pagr_history[i].page != page)
+			continue;
+		pagr_history[i] = pagr_history[pagr_history_count - 1];
+		memset(&pagr_history[pagr_history_count - 1], 0,
+		       sizeof(pagr_history[0]));
+		pagr_history_count--;
+		i--;
 	}
 
-	return -1;
-}
+	page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags = 0;
+	clear_page_neighbors(page);
+	*pagr_state_info(page) = zero;
+	page[PAGR_SAMPLE_PAGE_OFFSET].last_va = 0;
+	page[PAGR_SAMPLE_PAGE_OFFSET].last_cyc = 0;
+	page[PAGR_SAMPLE_PAGE_OFFSET].last_ip = 0;
 
-static unsigned long new_entry_stamp(void)
-{
-	if (++pagr_next_stamp == 0)
-		pagr_next_stamp = 1;
-
-	return pagr_next_stamp;
+	spin_unlock_irqrestore(&pagr_lock, flags);
 }
 
 static inline u64 update_top(u64 top, u64 val)
@@ -567,7 +572,7 @@ static u64 normalize_diff(u64 diff, u64 *top, u64 *bot)
 	return pagr_mul_div_sat(delta, PAGR_SCALE, *top - *bot);
 }
 
-static u64 calc_distance(struct pagr_entry *a, struct pagr_entry *b)
+static u64 calc_distance(struct pagr_sample *a, struct pagr_sample *b)
 {
 	u64 va_diff, cyc_diff, ip_diff, distance, dist_clip, dist_scaled;
 
@@ -599,55 +604,6 @@ static u64 calc_distance(struct pagr_entry *a, struct pagr_entry *b)
 	return distance ? distance : 1;
 }
 
-static void reset_entry(unsigned int idx)
-{
-	struct pagr_entry *entry = &pagr_entries[idx];
-
-	clear_neighbor_refs(idx);
-	clear_history_refs(idx);
-	clear_entry_neighbors(entry);
-	entry->page = NULL;
-	entry->va = 0;
-	entry->cyc = 0;
-	entry->ip = 0;
-	entry->stamp = 0;
-	entry->predicted = false;
-}
-
-static int alloc_entry(void)
-{
-	u64 min_cyc = U64_MAX;
-	u64 min_unpredicted_cyc = U64_MAX;
-	int fallback = -1;
-	int victim = -1;
-	int i;
-
-	for (i = 0; i < PAGR_ENTRY_TABLE_SIZE; i++) {
-		struct pagr_entry *entry = &pagr_entries[i];
-
-		if (!entry->page)
-			return i;
-
-		if (entry->cyc < min_cyc) {
-			min_cyc = entry->cyc;
-			fallback = i;
-		}
-
-		if (!entry->predicted && entry->cyc < min_unpredicted_cyc) {
-			min_unpredicted_cyc = entry->cyc;
-			victim = i;
-		}
-	}
-
-	if (victim < 0)
-		victim = fallback;
-	if (victim >= 0) {
-		pagr_stat_inc(PAGR_STAT_ENTRY_EVICTED);
-		reset_entry(victim);
-	}
-
-	return victim;
-}
 
 static bool pagr_prediction_target(struct page *page, int *src_nid,
 				   int *target_nid)
@@ -678,12 +634,9 @@ static bool pagr_prediction_target(struct page *page, int *src_nid,
 static void add_pagr_graph_record(struct pagr_graph_record *records,
 				  unsigned int *nr_records,
 				  unsigned int max_records,
-				  struct pagr_entry *old_entry,
-				  struct pagr_entry *cur_entry,
-				  unsigned int old_idx,
-				  unsigned int cur_idx,
+				  struct pagr_sample *old_sample,
+				  struct pagr_sample *cur_sample,
 				  unsigned int slot,
-				  unsigned int replaced_idx,
 				  u8 event,
 				  u64 distance,
 				  u64 time_diff)
@@ -695,114 +648,125 @@ static void add_pagr_graph_record(struct pagr_graph_record *records,
 
 	record = &records[(*nr_records)++];
 	memset(record, 0, sizeof(*record));
-	record->src_va = old_entry->va;
-	record->dst_va = cur_entry->va;
-	record->src_pfn = page_to_pfn(old_entry->page);
-	record->dst_pfn = page_to_pfn(cur_entry->page);
-	record->src_cyc = old_entry->cyc;
-	record->dst_cyc = cur_entry->cyc;
-	record->src_ip = old_entry->ip;
-	record->dst_ip = cur_entry->ip;
+	record->src_va = old_sample->va;
+	record->dst_va = cur_sample->va;
+	record->src_pfn = page_to_pfn(old_sample->page);
+	record->dst_pfn = page_to_pfn(cur_sample->page);
+	record->src_cyc = old_sample->cyc;
+	record->dst_cyc = cur_sample->cyc;
+	record->src_ip = old_sample->ip;
+	record->dst_ip = cur_sample->ip;
 	record->distance = distance;
 	record->time_diff = time_diff;
 	record->threshold = READ_ONCE(pagr_bot_dist);
 	record->avg_dist = READ_ONCE(pagr_avg_dist);
-	record->src_idx = old_idx;
-	record->dst_idx = cur_idx;
+	record->src_idx = PAGR_GRAPH_INVALID_IDX;
+	record->dst_idx = PAGR_GRAPH_INVALID_IDX;
 	record->slot = slot;
-	record->replaced_idx = replaced_idx;
+	record->replaced_idx = PAGR_GRAPH_INVALID_IDX;
 	record->event = event;
 }
 
-static void update_neighbors(unsigned int old_idx,
+static void update_neighbors(struct pagr_sample *old_sample,
 			     struct pagr_graph_record *graph_records,
 			     unsigned int *nr_graph_records,
 			     unsigned int max_graph_records)
 {
-	struct pagr_entry *old_entry = &pagr_entries[old_idx];
+	struct page *old_page = old_sample->page;
 	int i, j;
 
-	if (!old_entry->page)
+	if (!pagr_page_is_current(old_page, old_sample->generation))
 		return;
 
 	pagr_stat_inc(PAGR_STAT_NEIGHBOR_UPDATES);
 
 	for (i = 0; i < PAGR_MAX_NEIGHBORS; i++) {
-		if (old_entry->neighbors[i].idx != PAGR_INVALID_ENTRY)
-			old_entry->neighbors[i].distance =
-				old_entry->neighbors[i].distance *
-				PAGR_NEIGHBOR_DEC_NUM / PAGR_NEIGHBOR_DEC_DEN;
+		pginfo_t *neighbor = pagr_neighbor_info(old_page, i);
+
+		if (!neighbor->neighbor)
+			continue;
+		if (!pagr_page_is_current(neighbor->neighbor,
+					  neighbor->generation)) {
+			memset(neighbor, 0, sizeof(*neighbor));
+			continue;
+		}
+		neighbor->distance = pagr_mul_div_sat(neighbor->distance,
+						     PAGR_NEIGHBOR_DEC_NUM,
+						     PAGR_NEIGHBOR_DEC_DEN);
 	}
 
 	for (i = 0; i < pagr_history_count; i++) {
-		unsigned int cur_idx = pagr_history[i];
-		struct pagr_entry *cur_entry;
+		struct pagr_sample *cur_sample = &pagr_history[i];
+		pginfo_t *candidate = NULL;
+		bool same_neighbor = false;
+		bool empty_neighbor = false;
 		u64 distance;
-		int candidate = -1;
+		int candidate_slot = -1;
 
-		if (cur_idx == old_idx || cur_idx >= PAGR_ENTRY_TABLE_SIZE)
-			continue;
-
-		cur_entry = &pagr_entries[cur_idx];
-		if (!cur_entry->page || cur_entry->cyc <= old_entry->cyc)
+		if (cur_sample->page == old_page ||
+		    cur_sample->cyc <= old_sample->cyc ||
+		    !pagr_page_is_current(cur_sample->page,
+					  cur_sample->generation))
 			continue;
 
 		pagr_stat_inc(PAGR_STAT_NEIGHBOR_CANDIDATES);
-		distance = calc_distance(old_entry, cur_entry);
+		distance = calc_distance(old_sample, cur_sample);
 
 		for (j = 0; j < PAGR_MAX_NEIGHBORS; j++) {
-			struct pagr_neighbor *neighbor = &old_entry->neighbors[j];
+			pginfo_t *neighbor = pagr_neighbor_info(old_page, j);
 
-			if (neighbor->idx == cur_idx) {
-				candidate = j;
-				neighbor->distance = 0;
+			if (neighbor->neighbor &&
+			    !pagr_page_is_current(neighbor->neighbor,
+						  neighbor->generation))
+				memset(neighbor, 0, sizeof(*neighbor));
+
+			if (neighbor->neighbor == cur_sample->page &&
+			    neighbor->generation == cur_sample->generation) {
+				candidate = neighbor;
+				candidate_slot = j;
+				same_neighbor = true;
 				break;
 			}
-
-			if (neighbor->idx == PAGR_INVALID_ENTRY) {
-				candidate = j;
+			if (!neighbor->neighbor) {
+				candidate = neighbor;
+				candidate_slot = j;
+				empty_neighbor = true;
 				break;
 			}
-
-			if (candidate < 0 ||
-			    neighbor->distance > old_entry->neighbors[candidate].distance)
-				candidate = j;
+			if (!candidate ||
+			    neighbor->distance > candidate->distance) {
+				candidate = neighbor;
+				candidate_slot = j;
+			}
 		}
 
-		if (candidate >= 0) {
-			struct pagr_neighbor *neighbor =
-				&old_entry->neighbors[candidate];
-			unsigned int replaced_idx = neighbor->idx;
+		if (candidate &&
+		    (empty_neighbor || same_neighbor ||
+		     distance < candidate->distance)) {
 			u8 event;
 
-			if (neighbor->idx == PAGR_INVALID_ENTRY ||
-			    neighbor->idx == cur_idx ||
-			    distance < neighbor->distance) {
-				if (neighbor->idx == PAGR_INVALID_ENTRY)
-					event = PAGR_GRAPH_EDGE_INSERT;
-				else if (neighbor->idx == cur_idx)
-					event = PAGR_GRAPH_EDGE_REFRESH;
-				else
-					event = PAGR_GRAPH_EDGE_REPLACE;
+			if (empty_neighbor)
+				event = PAGR_GRAPH_EDGE_INSERT;
+			else if (same_neighbor)
+				event = PAGR_GRAPH_EDGE_REFRESH;
+			else
+				event = PAGR_GRAPH_EDGE_REPLACE;
 
-				add_pagr_graph_record(graph_records,
-						      nr_graph_records,
-						      max_graph_records,
-						      old_entry, cur_entry,
-						      old_idx, cur_idx,
-						      candidate, replaced_idx,
-						      event, distance,
-						      cur_entry->cyc -
-						      old_entry->cyc);
-				neighbor->idx = cur_idx;
-				neighbor->distance = distance;
-				neighbor->time_diff = cur_entry->cyc - old_entry->cyc;
-			}
+			add_pagr_graph_record(graph_records, nr_graph_records,
+					      max_graph_records, old_sample,
+					      cur_sample, candidate_slot, event,
+					      distance,
+					      cur_sample->cyc - old_sample->cyc);
+			candidate->neighbor = cur_sample->page;
+			candidate->distance = distance;
+			candidate->time_diff =
+				cur_sample->cyc - old_sample->cyc;
+			candidate->generation = cur_sample->generation;
 		}
 	}
 }
 
-static void record_history_sample(unsigned int idx,
+static void record_history_sample(struct pagr_sample *sample,
 				  struct pagr_graph_record *graph_records,
 				  unsigned int *nr_graph_records,
 				  unsigned int max_graph_records)
@@ -812,22 +776,21 @@ static void record_history_sample(unsigned int idx,
 	int i;
 
 	if (pagr_history_count < PAGR_HISTORY_SIZE) {
-		pagr_history[pagr_history_count++] = idx;
+		pagr_history[pagr_history_count++] = *sample;
 		pagr_stat_inc(PAGR_STAT_HISTORY_RECORDED);
 		return;
 	}
 
 	for (i = 0; i < PAGR_HISTORY_SIZE; i++) {
-		unsigned int old_idx = pagr_history[i];
+		struct pagr_sample *old_sample = &pagr_history[i];
 
-		if (old_idx >= PAGR_ENTRY_TABLE_SIZE ||
-		    !pagr_entries[old_idx].page) {
+		if (!pagr_page_is_current(old_sample->page,
+					  old_sample->generation)) {
 			old_slot = i;
 			break;
 		}
-
-		if (pagr_entries[old_idx].cyc < min_cyc) {
-			min_cyc = pagr_entries[old_idx].cyc;
+		if (old_sample->cyc < min_cyc) {
+			min_cyc = old_sample->cyc;
 			old_slot = i;
 		}
 	}
@@ -835,10 +798,9 @@ static void record_history_sample(unsigned int idx,
 	if (old_slot < 0)
 		return;
 
-	if (pagr_history[old_slot] < PAGR_ENTRY_TABLE_SIZE)
-		update_neighbors(pagr_history[old_slot], graph_records,
-				 nr_graph_records, max_graph_records);
-	pagr_history[old_slot] = idx;
+	update_neighbors(&pagr_history[old_slot], graph_records,
+			 nr_graph_records, max_graph_records);
+	pagr_history[old_slot] = *sample;
 	pagr_stat_inc(PAGR_STAT_HISTORY_RECORDED);
 	pagr_stat_inc(PAGR_STAT_HISTORY_WRAPPED);
 }
@@ -846,14 +808,13 @@ static void record_history_sample(unsigned int idx,
 void pagr_add_page(struct page *page, unsigned long va, unsigned long cyc,
 		   unsigned long ip)
 {
-	struct pagr_graph_record graph_records[PAGR_HISTORY_SIZE];
+	struct pagr_graph_record graph_records[PAGR_MAX_NEIGHBORS];
+	struct pagr_sample sample;
 	unsigned int nr_graph_records = 0;
 	unsigned int graph_interval;
-	struct pagr_entry *entry;
+	unsigned long generation;
 	unsigned long flags;
-	bool predicted;
 	bool log_graph = false;
-	int idx;
 
 	pagr_stat_inc(PAGR_STAT_ADD_CALLS);
 
@@ -864,63 +825,53 @@ void pagr_add_page(struct page *page, unsigned long va, unsigned long cyc,
 	}
 
 	page = compound_head(page);
-
 	spin_lock_irqsave(&pagr_lock, flags);
 
-	idx = find_entry(page);
-	if (idx < 0)
-		idx = alloc_entry();
-	if (idx < 0) {
-		spin_unlock_irqrestore(&pagr_lock, flags);
-		pagr_stat_inc(PAGR_STAT_ADD_ALLOC_FAIL);
-		pagr_debug_maybe_dump("add_alloc_fail");
-		return;
-	}
+	if (!pagr_page_generation(page, &generation)) {
+		pginfo_t zero = { 0 };
 
-	entry = &pagr_entries[idx];
-	if (!entry->page) {
-		clear_entry_neighbors(entry);
-		entry->stamp = new_entry_stamp();
-		entry->predicted = false;
+		clear_page_neighbors(page);
+		*pagr_state_info(page) = zero;
+		generation = new_page_generation();
+		pagr_state_info(page)->generation = generation;
+		page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags = 0;
+		__set_bit(PAGR_PAGE_TRACKED,
+			  &page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags);
 		pagr_stat_inc(PAGR_STAT_ENTRY_NEW);
 	} else {
 		pagr_stat_inc(PAGR_STAT_ENTRY_EXISTING);
 	}
 
-	entry->page = page;
-	entry->va = va;
-	entry->cyc = cyc;
-	entry->ip = ip;
-	predicted = entry->predicted;
+	page[PAGR_SAMPLE_PAGE_OFFSET].last_va = va;
+	page[PAGR_SAMPLE_PAGE_OFFSET].last_cyc = cyc;
+	page[PAGR_SAMPLE_PAGE_OFFSET].last_ip = ip;
+
+	sample.page = page;
+	sample.va = va;
+	sample.cyc = cyc;
+	sample.ip = ip;
+	sample.generation = generation;
+
 	if (READ_ONCE(pagr_graph_enabled)) {
 		graph_interval = max_t(unsigned int,
 				       READ_ONCE(pagr_graph_sample_interval), 1);
 		log_graph = (++pagr_graph_updates % graph_interval) == 0;
 	}
-	record_history_sample(idx, log_graph ? graph_records : NULL,
+	record_history_sample(&sample, log_graph ? graph_records : NULL,
 			      &nr_graph_records, ARRAY_SIZE(graph_records));
-
-	page[3].last_va = va;
-	page[3].last_cyc = cyc;
-	page[3].last_ip = ip;
-	__set_bit(PAGR_PAGE_IN_HISTORY, &page[3].pagr_flags);
-	if (predicted)
-		__set_bit(PAGR_PAGE_PREDICTED, &page[3].pagr_flags);
-	else
-		__clear_bit(PAGR_PAGE_PREDICTED, &page[3].pagr_flags);
 
 	spin_unlock_irqrestore(&pagr_lock, flags);
 	htmm_log_pagr_graph_records(graph_records, nr_graph_records);
 	pagr_debug_maybe_dump("add_page");
 }
 
-static bool prediction_already_selected(unsigned int *selected, int count,
-					unsigned int idx)
+static bool prediction_already_selected(struct page **selected, int count,
+					struct page *page)
 {
 	int i;
 
 	for (i = 0; i < count; i++) {
-		if (selected[i] == idx)
+		if (selected[i] == page)
 			return true;
 	}
 
@@ -929,16 +880,18 @@ static bool prediction_already_selected(unsigned int *selected, int count,
 
 int pagr_predict_pages(struct page *page, struct page **out_predictions)
 {
-	unsigned int selected[PAGR_MAX_PREDICTIONS];
+	struct page *selected[PAGR_MAX_PREDICTIONS];
+	struct page *cur_page;
+	unsigned long cur_generation;
 	unsigned long flags;
-	unsigned int max_predictions = min3(PAGR_MAX_PREDICTIONS,
-					    PAGR_MAX_PREDICTIONS_PER_SAMPLE,
-					    max_t(unsigned int,
-						  READ_ONCE(pagr_max_predictions_per_sample),
-						  1));
+	unsigned int max_predictions = min_t(unsigned int,
+			PAGR_MAX_PREDICTIONS,
+			min_t(unsigned int, PAGR_MAX_PREDICTIONS_PER_SAMPLE,
+			      max_t(unsigned int,
+				    READ_ONCE(pagr_max_predictions_per_sample),
+				    1)));
 	u64 threshold, mig_time, total_time_diff = 0;
 	int count = 0;
-	int cur_idx;
 	int depth, i;
 
 	pagr_stat_inc(PAGR_STAT_PRED_CALLS);
@@ -950,16 +903,15 @@ int pagr_predict_pages(struct page *page, struct page **out_predictions)
 	}
 
 	page = compound_head(page);
-
 	spin_lock_irqsave(&pagr_lock, flags);
 
-	cur_idx = find_entry(page);
-	if (cur_idx < 0) {
+	if (!pagr_page_generation(page, &cur_generation)) {
 		spin_unlock_irqrestore(&pagr_lock, flags);
-		pagr_stat_inc(PAGR_STAT_PRED_NO_ENTRY);
-		pagr_debug_maybe_dump("predict_no_entry");
+		pagr_stat_inc(PAGR_STAT_PRED_NO_METADATA);
+		pagr_debug_maybe_dump("predict_no_metadata");
 		return 0;
 	}
+	cur_page = page;
 
 	threshold = pagr_bot_dist;
 	if (!queue_count_snapshot() && READ_ONCE(pagr_mig_queue_time))
@@ -968,51 +920,57 @@ int pagr_predict_pages(struct page *page, struct page **out_predictions)
 		   READ_ONCE(pagr_mig_move_time);
 
 	for (depth = 0; depth < PAGR_PREDICTION_DEPTH; depth++) {
-		struct pagr_entry *cur_entry = &pagr_entries[cur_idx];
-		struct pagr_neighbor *closest = NULL;
+		pginfo_t closest = { 0 };
+		bool have_closest = false;
+
+		if (!pagr_page_is_current(cur_page, cur_generation))
+			break;
 
 		for (i = 0; i < PAGR_MAX_NEIGHBORS; i++) {
-			struct pagr_neighbor *neighbor = &cur_entry->neighbors[i];
-			struct pagr_entry *pred_entry;
+			pginfo_t *neighbor = pagr_neighbor_info(cur_page, i);
 			struct page *pred_page;
-			unsigned int pred_idx = neighbor->idx;
+			u64 arrival_time;
 
-			if (pred_idx == PAGR_INVALID_ENTRY ||
-			    pred_idx >= PAGR_ENTRY_TABLE_SIZE ||
-			    !neighbor->distance ||
+			if (!neighbor->neighbor || !neighbor->distance ||
 			    !neighbor->time_diff) {
 				pagr_stat_inc(PAGR_STAT_PRED_SKIP_EMPTY);
 				continue;
 			}
-
 			if (neighbor->distance >= threshold) {
 				pagr_stat_inc(PAGR_STAT_PRED_SKIP_DISTANCE);
 				continue;
 			}
 
-			pred_entry = &pagr_entries[pred_idx];
-			if (!pred_entry->page) {
+			pred_page = neighbor->neighbor;
+			if (!pagr_page_is_current(pred_page,
+						  neighbor->generation)) {
+				memset(neighbor, 0, sizeof(*neighbor));
 				pagr_stat_inc(PAGR_STAT_PRED_SKIP_STALE);
 				continue;
 			}
 
-			if (!closest || neighbor->distance < closest->distance)
-				closest = neighbor;
+			if (!have_closest ||
+			    neighbor->distance < closest.distance) {
+				closest = *neighbor;
+				have_closest = true;
+			}
 
-			if (neighbor->time_diff + total_time_diff <= mig_time) {
+			arrival_time = pagr_add_sat(neighbor->time_diff,
+						    total_time_diff);
+			if (arrival_time <= mig_time) {
 				pagr_stat_inc(PAGR_STAT_PRED_SKIP_TIME);
 				continue;
 			}
-			if (prediction_already_selected(selected, count, pred_idx)) {
+			if (prediction_already_selected(selected, count,
+							pred_page)) {
 				pagr_stat_inc(PAGR_STAT_PRED_SKIP_DUP_SELECTED);
 				continue;
 			}
-			if (pred_entry->predicted) {
+			if (test_bit(PAGR_PAGE_PREDICTED,
+				     &pred_page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags)) {
 				pagr_stat_inc(PAGR_STAT_PRED_SKIP_ALREADY_PRED);
 				continue;
 			}
-
-			pred_page = pred_entry->page;
 			if (!pagr_prediction_target(pred_page, NULL, NULL)) {
 				pagr_stat_inc(PAGR_STAT_PRED_SKIP_NOT_PROMOTABLE);
 				continue;
@@ -1020,15 +978,12 @@ int pagr_predict_pages(struct page *page, struct page **out_predictions)
 
 			printk_ratelimited("PAGR: predicted page pfn=%lx va=%lx src_pfn=%lx src_va=%lx distance=%llu threshold=%llu depth=%d time_diff=%llu mig_time=%llu\n",
 					   page_to_pfn(pred_page),
-					   pred_entry->va,
-					   page_to_pfn(cur_entry->page),
-					   cur_entry->va,
-					   neighbor->distance,
-					   threshold,
-					   depth,
-					   neighbor->time_diff,
-					   mig_time);
-			selected[count] = pred_idx;
+					   pred_page[PAGR_SAMPLE_PAGE_OFFSET].last_va,
+					   page_to_pfn(cur_page),
+					   cur_page[PAGR_SAMPLE_PAGE_OFFSET].last_va,
+					   (u64)neighbor->distance, threshold, depth,
+					   (u64)neighbor->time_diff, mig_time);
+			selected[count] = pred_page;
 			out_predictions[count++] = pred_page;
 			pagr_stat_inc(PAGR_STAT_PRED_SELECTED);
 			if (count >= max_predictions) {
@@ -1037,11 +992,13 @@ int pagr_predict_pages(struct page *page, struct page **out_predictions)
 			}
 		}
 
-		if (!closest || count >= max_predictions)
+		if (!have_closest || count >= max_predictions)
 			break;
 
-		total_time_diff += closest->time_diff;
-		cur_idx = closest->idx;
+		total_time_diff = pagr_add_sat(total_time_diff,
+					       closest.time_diff);
+		cur_page = closest.neighbor;
+		cur_generation = closest.generation;
 	}
 
 	spin_unlock_irqrestore(&pagr_lock, flags);
@@ -1062,13 +1019,13 @@ static unsigned int queue_count_locked(void)
 int queue_pagr_prediction(struct page *page)
 {
 	struct pagr_queue_entry queue_entry;
+	unsigned long generation;
 	unsigned long flags;
 	unsigned int next;
 	unsigned long va = 0;
 	unsigned long pfn = 0;
 	int src_nid = NUMA_NO_NODE;
 	int target_nid = NUMA_NO_NODE;
-	int idx;
 
 	pagr_stat_inc(PAGR_STAT_QUEUE_ATTEMPTS);
 
@@ -1092,18 +1049,18 @@ int queue_pagr_prediction(struct page *page)
 	}
 
 	spin_lock_irqsave(&pagr_lock, flags);
-	idx = find_entry(page);
-	if (idx < 0) {
+	if (!pagr_page_generation(page, &generation)) {
 		spin_unlock_irqrestore(&pagr_lock, flags);
-		pagr_stat_inc(PAGR_STAT_QUEUE_MISSING_HISTORY);
-		printk_ratelimited("PAGR: drop prediction missing history pfn=%lx\n",
+		pagr_stat_inc(PAGR_STAT_QUEUE_MISSING_METADATA);
+		printk_ratelimited("PAGR: drop prediction missing metadata pfn=%lx\n",
 				   pfn);
-		pagr_debug_maybe_dump("queue_missing_history");
+		pagr_debug_maybe_dump("queue_missing_metadata");
 		return NUMA_NO_NODE;
 	}
 
-	if (pagr_entries[idx].predicted) {
-		va = pagr_entries[idx].va;
+	va = page[PAGR_SAMPLE_PAGE_OFFSET].last_va;
+	if (test_bit(PAGR_PAGE_PREDICTED,
+		     &page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags)) {
 		spin_unlock_irqrestore(&pagr_lock, flags);
 		pagr_stat_inc(PAGR_STAT_QUEUE_DUPLICATE);
 		printk_ratelimited("PAGR: drop duplicate prediction pfn=%lx va=%lx nid=%d\n",
@@ -1112,14 +1069,13 @@ int queue_pagr_prediction(struct page *page)
 		return NUMA_NO_NODE;
 	}
 
-	pagr_entries[idx].predicted = true;
-	__set_bit(PAGR_PAGE_PREDICTED, &page[3].pagr_flags);
-	queue_entry.idx = idx;
-	queue_entry.stamp = pagr_entries[idx].stamp;
+	__set_bit(PAGR_PAGE_PREDICTED,
+		  &page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags);
+	queue_entry.page = page;
+	queue_entry.generation = generation;
 	queue_entry.src_nid = src_nid;
 	queue_entry.target_nid = target_nid;
 	queue_entry.enqueue_cyc = rdtsc();
-	va = pagr_entries[idx].va;
 	spin_unlock_irqrestore(&pagr_lock, flags);
 
 	spin_lock_irqsave(&pagr_queue_lock, flags);
@@ -1128,10 +1084,9 @@ int queue_pagr_prediction(struct page *page)
 		spin_unlock_irqrestore(&pagr_queue_lock, flags);
 
 		spin_lock_irqsave(&pagr_lock, flags);
-		if (pagr_entries[idx].stamp == queue_entry.stamp) {
-			pagr_entries[idx].predicted = false;
-			__clear_bit(PAGR_PAGE_PREDICTED, &page[3].pagr_flags);
-		}
+		if (pagr_page_is_current(page, generation))
+			__clear_bit(PAGR_PAGE_PREDICTED,
+				    &page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags);
 		spin_unlock_irqrestore(&pagr_lock, flags);
 
 		pagr_stat_inc(PAGR_STAT_QUEUE_FULL);
@@ -1181,8 +1136,8 @@ static bool dequeue_pagr_prediction(int nid, struct pagr_queue_entry *out)
 			break;
 
 		entry = pagr_prediction_queue[pagr_queue_tail];
-		pagr_prediction_queue[pagr_queue_tail].idx = PAGR_INVALID_ENTRY;
-		pagr_prediction_queue[pagr_queue_tail].stamp = 0;
+		pagr_prediction_queue[pagr_queue_tail].page = NULL;
+		pagr_prediction_queue[pagr_queue_tail].generation = 0;
 		pagr_queue_tail = (pagr_queue_tail + 1) % PAGR_QUEUE_SIZE;
 
 		if (entry.src_nid == nid) {
@@ -1206,23 +1161,6 @@ static bool dequeue_pagr_prediction(int nid, struct pagr_queue_entry *out)
 	return found;
 }
 
-static void forget_history_entry(unsigned int idx, unsigned long stamp,
-				 struct page *page)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&pagr_lock, flags);
-
-	if (idx < PAGR_ENTRY_TABLE_SIZE &&
-	    pagr_entries[idx].page == page &&
-	    pagr_entries[idx].stamp == stamp) {
-		reset_entry(idx);
-		__clear_bit(PAGR_PAGE_IN_HISTORY, &page[3].pagr_flags);
-		__clear_bit(PAGR_PAGE_PREDICTED, &page[3].pagr_flags);
-	}
-
-	spin_unlock_irqrestore(&pagr_lock, flags);
-}
 
 unsigned long process_pagr_predictions(pg_data_t *pgdat)
 {
@@ -1246,17 +1184,15 @@ unsigned long process_pagr_predictions(pg_data_t *pgdat)
 			break;
 
 		processed++;
-		if (queue_entry.idx >= PAGR_ENTRY_TABLE_SIZE)
-			continue;
-
 		spin_lock_irqsave(&pagr_lock, flags);
-		if (pagr_entries[queue_entry.idx].page &&
-		    pagr_entries[queue_entry.idx].stamp == queue_entry.stamp) {
-			page = pagr_entries[queue_entry.idx].page;
-			pagr_entries[queue_entry.idx].predicted = false;
-			__clear_bit(PAGR_PAGE_PREDICTED, &page[3].pagr_flags);
+		if (pagr_page_is_current(queue_entry.page,
+					 queue_entry.generation) &&
+		    test_bit(PAGR_PAGE_PREDICTED,
+			     &queue_entry.page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags)) {
+			page = queue_entry.page;
+			__clear_bit(PAGR_PAGE_PREDICTED,
+				    &page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags);
 		}
-
 		spin_unlock_irqrestore(&pagr_lock, flags);
 
 		if (!page) {
@@ -1268,7 +1204,8 @@ unsigned long process_pagr_predictions(pg_data_t *pgdat)
 		if (queue_entry.enqueue_cyc && start_cyc > queue_entry.enqueue_cyc) {
 			WRITE_ONCE(pagr_mig_queue_time,
 				   update_mig_time(READ_ONCE(pagr_mig_queue_time),
-						   start_cyc - queue_entry.enqueue_cyc));
+						   start_cyc -
+						   queue_entry.enqueue_cyc));
 		}
 
 		migrated = migrate_pagr_predicted_page(pgdat, page);
@@ -1289,11 +1226,6 @@ unsigned long process_pagr_predictions(pg_data_t *pgdat)
 						   move_diff));
 		}
 
-		if (migrated) {
-			forget_history_entry(queue_entry.idx,
-					     queue_entry.stamp,
-					     page);
-		}
 	}
 
 	if (processed)

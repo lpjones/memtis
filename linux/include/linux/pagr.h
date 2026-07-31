@@ -6,9 +6,14 @@
 #define CPUS_PER_SOCKET 16
 #define MAX_MIGRATION_RATE_IN_MBPS  2048 /* 2048MB per sec */
 
+/* Recent temporal samples only; graph nodes and edges live in each THP. */
 #define PAGR_HISTORY_SIZE	16
-#define PAGR_ENTRY_TABLE_SIZE	1024
+/* One reserved tail-page metadata record per outgoing edge. */
 #define PAGR_MAX_NEIGHBORS	4
+#define PAGR_SAMPLE_PAGE_OFFSET	3
+#define PAGR_NEIGHBOR_PAGE_OFFSET	4
+#define PAGR_STATE_PAGE_OFFSET	(PAGR_NEIGHBOR_PAGE_OFFSET + \
+				 PAGR_MAX_NEIGHBORS)
 #define PAGR_PREDICTION_DEPTH	16
 #define PAGR_MAX_PREDICTIONS	(PAGR_MAX_NEIGHBORS * PAGR_PREDICTION_DEPTH)
 #define PAGR_MAX_PREDICTIONS_PER_SAMPLE	8
@@ -19,7 +24,7 @@
 #define PAGR_GRAPH_VERSION	1
 #define PAGR_GRAPH_INVALID_IDX	(~0U)
 
-#define PAGR_PAGE_IN_HISTORY	0
+#define PAGR_PAGE_TRACKED	0
 #define PAGR_PAGE_PREDICTED	1
 
 extern unsigned int pagr_fast_threshold_min_percent;
@@ -123,6 +128,8 @@ enum events {
 /* htmm_core.c */
 extern void htmm_mm_init(struct mm_struct *mm);
 extern void htmm_mm_exit(struct mm_struct *mm);
+extern void pagr_init_transhuge_metadata(struct page *page);
+extern void pagr_migrate_page_metadata(struct page *page, struct page *newpage);
 extern void __prep_transhuge_page_for_htmm(struct mm_struct *mm, struct page *page);
 extern void prep_transhuge_page_for_htmm(struct vm_area_struct *vma,
 					 struct page *page);

@@ -233,6 +233,20 @@ void htmm_mm_exit(struct mm_struct *mm)
     /* do nothing */
 }
 
+void pagr_init_transhuge_metadata(struct page *page)
+{
+    int i;
+    pginfo_t zero_pginfo = { 0 };
+
+    page[PAGR_SAMPLE_PAGE_OFFSET].last_va = 0;
+    page[PAGR_SAMPLE_PAGE_OFFSET].last_cyc = 0;
+    page[PAGR_SAMPLE_PAGE_OFFSET].last_ip = 0;
+    page[PAGR_SAMPLE_PAGE_OFFSET].pagr_flags = 0;
+    for (i = PAGR_NEIGHBOR_PAGE_OFFSET;
+         i <= PAGR_STATE_PAGE_OFFSET; i++)
+	page[i].pagr_info = zero_pginfo;
+}
+
 /* Hugepage uses tail pages to store access information.
  * See struct page declaration in linux/mm_types.h */
 void __prep_transhuge_page_for_htmm(struct mm_struct *mm, struct page *page)
@@ -270,9 +284,7 @@ void __prep_transhuge_page_for_htmm(struct mm_struct *mm, struct page *page)
     else
 	page[3].cooling_clock = memcg->cooling_clock;
 #elif defined(CONFIG_PAGR)
-    page[3].last_va = 0;
-    page[3].last_cyc = 0;
-    page[3].last_ip = 0;
+    pagr_init_transhuge_metadata(page);
     /* No SetPageHtmm for CONFIG_PAGR */
 #endif
 
@@ -338,10 +350,7 @@ void copy_transhuge_pginfo(struct page *page,
 	SetPageHtmm(&newpage[idx]);
     }
 #elif defined(CONFIG_PAGR)
-    newpage[3].last_va = page[3].last_va;
-    newpage[3].last_cyc = page[3].last_cyc;
-    newpage[3].last_ip = page[3].last_ip;
-    /* No SetPageHtmm for CONFIG_PAGR */
+    pagr_migrate_page_metadata(page, newpage);
 #endif
 }
 
@@ -364,17 +373,9 @@ pginfo_t *get_compound_pginfo(struct page *page, unsigned long address)
 
     return &(page[idx].compound_pginfo[offset]);
 #elif defined(CONFIG_PAGR)
-    int neighbor_idx = 0; /* Or whatever logic applies to neighbor_idx */
-    int tail_page_idx;
     VM_BUG_ON_PAGE(!PageCompound(page), page);
-
-    if (address) {
-	neighbor_idx = ((address & ~HPAGE_PMD_MASK) >> PAGE_SHIFT) / 32; /* assuming neighbor_idx was 0~15 */
-    }
-
-    tail_page_idx = 4 + neighbor_idx;
-
-    return &(page[tail_page_idx].pagr_info);
+    /* PAGR metadata is a per-THP neighbor list, not per-base-page data. */
+    return &page[PAGR_NEIGHBOR_PAGE_OFFSET].pagr_info;
 #else
     return NULL;
 #endif

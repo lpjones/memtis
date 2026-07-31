@@ -289,6 +289,8 @@ typedef struct {
 	struct page *neighbor;
 	unsigned long distance;	/* 10000x (12345 = 1.2345)*/
 	unsigned long time_diff;
+	/* Generation of neighbor, or this page in the state metadata slot. */
+	unsigned long generation;
 } pginfo_t;
 #endif
 

@@ -16,7 +16,7 @@ DIR=/proj/TppPlus/tpp/memtis/memtis-userspace
 plot_dir=/proj/TppPlus/tpp/scripts/plot_scripts
 py_bin=/proj/TppPlus/tpp/scripts/venv/bin/python
 RESULTS_DIR=${RESULTS_DIR:-${DIR}/results}
-BENCHMARK_TIMEOUT=${BENCHMARK_TIMEOUT:-10m}
+BENCHMARK_TIMEOUT=${BENCHMARK_TIMEOUT:-1h}
 SAMPLER_CLEANUP_TIMEOUT=${SAMPLER_CLEANUP_TIMEOUT:-30s}
 
 CONFIG_PERF=off

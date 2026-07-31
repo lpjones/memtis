@@ -191,7 +191,6 @@ struct page {
 				};
 				struct {	/* Fourth~ tail pages of compound page */
 					pginfo_t pagr_info;
-					/* 8 bytes left */
 				};
 			};
 		};

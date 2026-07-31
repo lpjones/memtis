@@ -2,7 +2,8 @@
 # py_bin="/proj/TppPlus/tpp/scripts/venv/bin/python"
 
 trials=3
-node=1.02
+node=1.03
+prefix="pagr"
 
 function bench_run() {
     local prefix=$1; shift
@@ -17,18 +18,18 @@ function bench_run() {
     done
 }
 
-bench_run "og" "cgups" $trials $node
-bench_run "og" "resnet" $trials $node
-bench_run "og" "stream" $trials $node
-bench_run "og" "xsbench" $trials $node
-bench_run "og" "graph500" $trials $node
-bench_run "og" "pagerank" $trials $node
-bench_run "og" "silo" $trials $node
-bench_run "og" "liblinear" $trials $node
-bench_run "og" "btree" $trials $node
-bench_run "og" "dlrm" $trials $node
-bench_run "og" "gapbs-bfs" $trials $node
-bench_run "og" "nas-cg" $trials $node
-bench_run "og" "llama-matmul" $trials $node
-bench_run "og" "diskann" $trials $node
+# bench_run "$prefix" "cgups" $trials $node
+# bench_run "$prefix" "resnet" $trials $node
+# bench_run "$prefix" "stream" $trials $node
+# bench_run "$prefix" "xsbench" $trials $node
+# bench_run "$prefix" "graph500" $trials $node
+# bench_run "$prefix" "pagerank" $trials $node
+# bench_run "$prefix" "silo" $trials $node
+# bench_run "$prefix" "liblinear" $trials $node
+bench_run "$prefix" "btree" $trials $node
+bench_run "$prefix" "dlrm" $trials $node
+bench_run "$prefix" "gapbs-bfs" $trials $node
+bench_run "$prefix" "nas-cg" $trials $node
+bench_run "$prefix" "llama-matmul" $trials $node
+bench_run "$prefix" "diskann" $trials $node
 

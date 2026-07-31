@@ -723,7 +723,7 @@ void migrate_page_states(struct page *newpage, struct page *page)
 		SetPageReadahead(newpage);
 
 	copy_page_owner(page, newpage);
-#ifdef CONFIG_HTMM
+#if defined(CONFIG_HTMM) || defined(CONFIG_PAGR)
 	if (PageTransHuge(page))
 	    copy_transhuge_pginfo(page, newpage);
 #endif
